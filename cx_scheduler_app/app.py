@@ -1,3 +1,8 @@
+App · PY
+
+
+IDLE
+
 import streamlit as st
 import streamlit.components.v1 as st_components
 import sqlite3
@@ -6,16 +11,16 @@ import datetime
 import hashlib
 import secrets
 from pathlib import Path
-
+ 
 st.set_page_config(
     page_title="CX Scheduler",
     page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
+ 
 DB_PATH = Path(__file__).parent / "cx_scheduler.db"
-
+ 
 ACTIVITY_TYPES = [
     ".", "Chat", "Phones",
     "CA - Studio", "CA - Remote", "HPO",
@@ -24,9 +29,9 @@ ACTIVITY_TYPES = [
     "Meeting", "Admin", "Break",
     "Bereavement", "FMLA", "Training", "Holiday", "PTO", "VTO", "Sick",
 ]
-
+ 
 TIMEOFF_TYPES = ["PTO", "Sick", "Personal", "Holiday", "Bereavement", "Vacation", "FMLA", "VTO"]
-
+ 
 # (bg_hex, text_hex)
 ACT_COLORS = {
     "Chat":              ("#DBEAFE", "#1E40AF"),
@@ -55,9 +60,9 @@ ACT_COLORS = {
     "Sick":              ("#FECACA", "#7F1D1D"),
     ".":                 ("#F8FAFC", "#CBD5E1"),
 }
-
+ 
 SLOT_W = 26   # px per 30-min slot in timeline
-
+ 
 def _make_time_slots():
     slots = []
     t = datetime.time(6, 30)
@@ -67,10 +72,10 @@ def _make_time_slots():
         dt = datetime.datetime.combine(datetime.date.today(), t) + datetime.timedelta(minutes=30)
         t = dt.time()
     return slots
-
+ 
 TIME_SLOTS = _make_time_slots()
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-
+ 
 def _fmt_slot(slot_str):
     """'9:00 AM' → '9a',  '9:30 AM' → '930a',  '12:00 PM' → '12p'"""
     try:
@@ -80,15 +85,15 @@ def _fmt_slot(slot_str):
         return f"{h}{suffix}" if m == "00" else f"{h}{m}{suffix}"
     except Exception:
         return slot_str
-
-
+ 
+ 
 # ─── DATABASE ─────────────────────────────────────────────────────────────────
-
+ 
 def get_conn():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
-
+ 
 def init_db():
     conn = get_conn()
     c = conn.cursor()
@@ -166,10 +171,10 @@ def init_db():
         );
     """)
     conn.commit()
-
+ 
     def _col_names(table):
         return [row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()]
-
+ 
     if "team_name" not in _col_names("agents") and "team" in _col_names("agents"):
         c.executescript("""
             ALTER TABLE agents RENAME TO agents_old;
@@ -187,7 +192,7 @@ def init_db():
             DROP TABLE agents_old;
         """)
         conn.commit()
-
+ 
     if "team_name" not in _col_names("time_off_requests"):
         if "team" in _col_names("time_off_requests"):
             c.executescript("""
@@ -211,11 +216,11 @@ def init_db():
         else:
             c.execute("ALTER TABLE time_off_requests ADD COLUMN team_name TEXT NOT NULL DEFAULT ''")
         conn.commit()
-
+ 
     if "notes" not in _col_names("agents"):
         c.execute("ALTER TABLE agents ADD COLUMN notes TEXT DEFAULT ''")
         conn.commit()
-
+ 
     if c.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
         c.executemany(
             "INSERT OR IGNORE INTO teams (name, color, description) VALUES (?,?,?)",
@@ -225,7 +230,7 @@ def init_db():
             ]
         )
         conn.commit()
-
+ 
     if c.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0:
         sample = [
             ("Alex Chen",       "Support", "FT", 40, "Mon,Tue,Wed,Thu,Fri"),
@@ -244,7 +249,7 @@ def init_db():
             sample
         )
         conn.commit()
-
+ 
     if c.execute("SELECT COUNT(*) FROM time_off_requests").fetchone()[0] == 0:
         today = datetime.date.today()
         nxt = today - datetime.timedelta(days=today.weekday()) + datetime.timedelta(weeks=1)
@@ -270,7 +275,7 @@ def init_db():
             seed_acts,
         )
         conn.commit()
-
+ 
     if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         salt = secrets.token_hex(16)
         h = hashlib.sha256(f"{salt}:admin".encode()).hexdigest()
@@ -279,48 +284,48 @@ def init_db():
             ("admin", f"{salt}:{h}", "Admin", "admin", 1, str(datetime.date.today())),
         )
         conn.commit()
-
+ 
     conn.close()
-
-
+ 
+ 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
-
+ 
 def _hash_pw(password, salt=None):
     if salt is None:
         salt = secrets.token_hex(16)
     h = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
     return f"{salt}:{h}"
-
+ 
 def _verify_pw(password, stored):
     try:
         salt, h = stored.split(":", 1)
         return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest() == h
     except Exception:
         return False
-
+ 
 def current_user():
     return st.session_state.get("cx_user")
-
+ 
 def is_admin():
     u = current_user()
     return bool(u and u["role"] == "admin")
-
+ 
 def can_edit():
     u = current_user()
     return bool(u and u["role"] in ("admin", "editor"))
-
+ 
 def get_user_by_username(username):
     conn = get_conn()
     row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
     conn.close()
     return dict(row) if row else None
-
+ 
 def list_users():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM users ORDER BY role, username").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
+ 
 def create_user(username, password, display_name, role):
     conn = get_conn()
     try:
@@ -334,7 +339,7 @@ def create_user(username, password, display_name, role):
     except sqlite3.IntegrityError:
         conn.close()
         return False, f"Username '{username}' already exists."
-
+ 
 def update_user(user_id, display_name, role, active):
     conn = get_conn()
     conn.execute(
@@ -343,19 +348,19 @@ def update_user(user_id, display_name, role, active):
     )
     conn.commit()
     conn.close()
-
+ 
 def reset_password(user_id, new_password):
     conn = get_conn()
     conn.execute("UPDATE users SET password_hash=? WHERE id=?", (_hash_pw(new_password), user_id))
     conn.commit()
     conn.close()
-
+ 
 def delete_user_db(user_id):
     conn = get_conn()
     conn.execute("DELETE FROM users WHERE id=?", (user_id,))
     conn.commit()
     conn.close()
-
+ 
 def show_login():
     st.markdown("""
     <style>
@@ -371,12 +376,12 @@ def show_login():
         <div class="login-logo">CX Scheduler</div>
         <div class="login-brand">Framebridge</div>
     </div>""", unsafe_allow_html=True)
-
+ 
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
-
+ 
     if submitted:
         user = get_user_by_username(username)
         if user and user["active"] and _verify_pw(password, user["password_hash"]):
@@ -389,29 +394,29 @@ def show_login():
             st.rerun()
         else:
             st.error("Invalid username or password.")
-
+ 
     st.stop()
-
-
+ 
+ 
 # ─── ACTIVITIES ───────────────────────────────────────────────────────────────
-
+ 
 def get_activities():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM activities ORDER BY sort_order, name").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
+ 
 def get_activity_names():
     """Return [".", ...all activities ordered...]"""
     return ["."] + [a["name"] for a in get_activities()]
-
+ 
 def get_act_colors():
     """Return {name: (bg_hex, fg_hex)} from DB, with '.' entry included."""
     colors = {".": ("#F8FAFC", "#CBD5E1")}
     for a in get_activities():
         colors[a["name"]] = (a["bg_color"], a["fg_color"])
     return colors
-
+ 
 def upsert_activity(name, bg_color, fg_color, activity_id=None, sort_order=99):
     conn = get_conn()
     try:
@@ -432,26 +437,26 @@ def upsert_activity(name, bg_color, fg_color, activity_id=None, sort_order=99):
     except sqlite3.IntegrityError:
         conn.close()
         return False, f"Activity '{name}' already exists."
-
+ 
 def delete_activity_db(activity_id):
     conn = get_conn()
     conn.execute("DELETE FROM activities WHERE id=?", (activity_id,))
     conn.commit()
     conn.close()
-
-
+ 
+ 
 def get_teams():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM teams ORDER BY name").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
+ 
 def get_team_color(team_name):
     conn = get_conn()
     row = conn.execute("SELECT color FROM teams WHERE name=?", (team_name,)).fetchone()
     conn.close()
     return row["color"] if row else "#94A3B8"
-
+ 
 def upsert_team(name, color, description, team_id=None):
     conn = get_conn()
     try:
@@ -467,13 +472,13 @@ def upsert_team(name, color, description, team_id=None):
     except sqlite3.IntegrityError:
         conn.close()
         return False, f"A team named '{name}' already exists."
-
+ 
 def delete_team(team_id):
     conn = get_conn()
     conn.execute("DELETE FROM teams WHERE id=?", (team_id,))
     conn.commit()
     conn.close()
-
+ 
 def get_agents(team_filter=None):
     conn = get_conn()
     if team_filter:
@@ -482,10 +487,10 @@ def get_agents(team_filter=None):
         rows = conn.execute("SELECT * FROM agents ORDER BY team_name, name").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
+ 
 def get_agent_names(team_filter=None):
     return [a["name"] for a in get_agents(team_filter)]
-
+ 
 def upsert_agent(name, team_name, emp_type, hours, work_days, notes, agent_id=None):
     conn = get_conn()
     try:
@@ -505,13 +510,13 @@ def upsert_agent(name, team_name, emp_type, hours, work_days, notes, agent_id=No
     except sqlite3.IntegrityError:
         conn.close()
         return False, f"An agent named '{name}' already exists."
-
+ 
 def delete_agent(agent_id):
     conn = get_conn()
     conn.execute("DELETE FROM agents WHERE id=?", (agent_id,))
     conn.commit()
     conn.close()
-
+ 
 def get_schedule_df(week_start, day_index, agent_names):
     conn = get_conn()
     rows = conn.execute(
@@ -526,7 +531,7 @@ def get_schedule_df(week_start, day_index, agent_names):
     df = pd.DataFrame(data, index=TIME_SLOTS)
     df.index.name = "Time"
     return df
-
+ 
 def save_schedule_df(week_start, day_index, df):
     conn = get_conn()
     c = conn.cursor()
@@ -541,7 +546,7 @@ def save_schedule_df(week_start, day_index, df):
             """, (week_start, day_index, slot, agent, act))
     conn.commit()
     conn.close()
-
+ 
 def copy_week(src, tgt):
     conn = get_conn()
     c = conn.cursor()
@@ -555,7 +560,7 @@ def copy_week(src, tgt):
     conn.commit()
     conn.close()
     return True, f"Copied to week of {tgt}."
-
+ 
 def apply_approved_timeoff(week_start):
     week_date = datetime.date.fromisoformat(week_start)
     conn = get_conn()
@@ -578,21 +583,21 @@ def apply_approved_timeoff(week_start):
     conn.commit()
     conn.close()
     return count
-
+ 
 # ─── TEMPLATES ────────────────────────────────────────────────────────────────
-
+ 
 def get_templates():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM templates ORDER BY name").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
+ 
 def get_template(template_id):
     conn = get_conn()
     row = conn.execute("SELECT * FROM templates WHERE id=?", (template_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
-
+ 
 def create_template(name, description="", created_by=""):
     conn = get_conn()
     today = str(datetime.date.today())
@@ -608,7 +613,7 @@ def create_template(name, description="", created_by=""):
     except sqlite3.IntegrityError:
         conn.close()
         return False, None, f"A template named '{name}' already exists."
-
+ 
 def update_template_meta(template_id, name, description):
     conn = get_conn()
     try:
@@ -622,14 +627,14 @@ def update_template_meta(template_id, name, description):
     except sqlite3.IntegrityError:
         conn.close()
         return False, f"A template named '{name}' already exists."
-
+ 
 def delete_template(template_id):
     conn = get_conn()
     conn.execute("DELETE FROM template_cells WHERE template_id=?", (template_id,))
     conn.execute("DELETE FROM templates WHERE id=?", (template_id,))
     conn.commit()
     conn.close()
-
+ 
 def get_template_df(template_id, day_index, agent_names):
     conn = get_conn()
     rows = conn.execute(
@@ -644,7 +649,7 @@ def get_template_df(template_id, day_index, agent_names):
     df = pd.DataFrame(data, index=TIME_SLOTS)
     df.index.name = "Time"
     return df
-
+ 
 def save_template_df(template_id, day_index, df):
     conn = get_conn()
     c = conn.cursor()
@@ -659,7 +664,7 @@ def save_template_df(template_id, day_index, df):
             """, (template_id, day_index, slot, agent, act))
     conn.commit()
     conn.close()
-
+ 
 def save_week_as_template(week_start, template_name, description="", created_by=""):
     """Copy all schedule_cells for week_start into a new template."""
     ok, template_id, msg = create_template(template_name, description, created_by)
@@ -674,7 +679,7 @@ def save_week_as_template(week_start, template_name, description="", created_by=
     conn.commit()
     conn.close()
     return True, template_id, f"Saved as template '{template_name}'."
-
+ 
 def apply_template_to_week(template_id, week_start):
     """Copy template_cells into schedule_cells for the given week, overwriting conflicts."""
     conn = get_conn()
@@ -695,7 +700,7 @@ def apply_template_to_week(template_id, week_start):
     conn.commit()
     conn.close()
     return count
-
+ 
 def duplicate_template(src_id, new_name):
     """Clone an existing template under a new name."""
     src = get_template(src_id)
@@ -715,8 +720,8 @@ def duplicate_template(src_id, new_name):
     conn.commit()
     conn.close()
     return True, new_id, f"Duplicated as '{new_name}'."
-
-
+ 
+ 
 def get_time_off_requests(status=None):
     conn = get_conn()
     if status:
@@ -725,13 +730,13 @@ def get_time_off_requests(status=None):
         rows = conn.execute("SELECT * FROM time_off_requests ORDER BY submitted_date DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
-
+ 
 def update_request_status(req_id, status, approved_by=""):
     conn = get_conn()
     conn.execute("UPDATE time_off_requests SET status=?,approved_by=? WHERE id=?", (status, approved_by, req_id))
     conn.commit()
     conn.close()
-
+ 
 def add_time_off_request(agent, team, start, end, rtype, notes=""):
     conn = get_conn()
     conn.execute(
@@ -740,9 +745,9 @@ def add_time_off_request(agent, team, start, end, rtype, notes=""):
     )
     conn.commit()
     conn.close()
-
+ 
 # ─── TIMELINE HTML ────────────────────────────────────────────────────────────
-
+ 
 def build_timeline_html(agents_info, schedule_data, act_colors=None):
     """
     Transposed grid layout: times down the left, agent names across the top.
@@ -755,12 +760,12 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
     _INACTIVE_LOCAL = {".", "Break", "Admin", "PTO", "VTO", "Sick",
                        "Holiday", "Bereavement", "FMLA", "Training", "Meeting"}
     _ON_QUEUE_LOCAL = {"Chat", "Phones"}
-
+ 
     TIME_COL_W  = 54   # px — left time-label column
     AGENT_COL_W = 96   # px — each agent column
     ROW_H       = 26   # px — each time-slot row
     FONT        = "'DM Sans','Apercu Pro',Helvetica,Arial,sans-serif"
-
+ 
     # ── Header row: one <th> per agent ────────────────────────────────────────
     agent_ths = ""
     for ag in agents_info:
@@ -784,7 +789,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
             f'{short}'
             f'</th>'
         )
-
+ 
     # Summary column headers (Active count, On-Queue count)
     sum_th_style = (
         f'position:sticky;top:0;z-index:2;min-width:42px;'
@@ -796,13 +801,13 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         f'<th style="{sum_th_style};background:#1A3A6A;color:#BFDBFE">Active</th>'
         f'<th style="{sum_th_style};background:#0C3047;color:#BAE6FD">Queue</th>'
     )
-
+ 
     # ── Body: one <tr> per time slot ──────────────────────────────────────────
     rows_html = ""
     for slot in TIME_SLOTS:
         label   = _fmt_slot(slot)
         is_hour = slot.split(":")[1].startswith("00")
-
+ 
         # Time label cell (sticky left column)
         time_bg     = "#1D2019" if is_hour else "#252520"
         time_color  = "#FFF9F4" if is_hour else "#8A8880"
@@ -818,7 +823,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
             f'border:1px solid rgba(255,255,255,0.1);{border_top}'
             f'white-space:nowrap;box-sizing:border-box">{label}</td>'
         )
-
+ 
         # One cell per agent
         active_count = 0
         queue_count  = 0
@@ -840,7 +845,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
                 f'border:1px solid rgba(0,0,0,0.22);{border_top}'
                 f'overflow:hidden;white-space:nowrap;box-sizing:border-box">{lbl}</td>'
             )
-
+ 
         # Summary cells
         n = max(len(agents_info), 1)
         a_op  = round(0.12 + 0.55 * min(active_count / n, 1.0), 3) if active_count else 0.06
@@ -859,9 +864,9 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
             f'<td style="background:{q_bg};color:#0C4A6E;{sum_td_base}">'
             f'{queue_count if queue_count else ""}</td>'
         )
-
+ 
         rows_html += f"<tr>{time_td}{agent_tds}{summary_tds}</tr>\n"
-
+ 
     # Corner cell for the sticky top-left intersection
     corner = (
         f'<th style="position:sticky;top:0;left:0;z-index:4;'
@@ -871,7 +876,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         f'border:1px solid rgba(255,255,255,0.14);'
         f'letter-spacing:0.08em;text-transform:uppercase">TIME</th>'
     )
-
+ 
     css = f"""
     <style>
     .tl-wrap {{
@@ -890,7 +895,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         table-layout:fixed;
     }}
     </style>"""
-
+ 
     html = f"""{css}
     <div class="tl-wrap">
         <div class="tl-scroll">
@@ -905,9 +910,9 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         </div>
     </div>"""
     return html
-
+ 
 # ─── COVERAGE BAR ────────────────────────────────────────────────────────────
-
+ 
 # Activities shown as rows in the coverage bar (label, fg_color, bg_color)
 COVERAGE_ROWS = [
     ("Chat",        "#1E40AF", "#BFDBFE"),
@@ -921,11 +926,11 @@ COVERAGE_ROWS = [
 _ON_QUEUE  = {"Chat", "Phones"}
 _INACTIVE  = {".", "Break", "Admin", "PTO", "VTO", "Sick",
               "Holiday", "Bereavement", "FMLA", "Training"}
-
+ 
 def _hex_to_rgb(h):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
+ 
 def _blend(hex_color, intensity):
     """Blend hex_color with white by intensity (0=white, 1=full color)."""
     r, g, b = _hex_to_rgb(hex_color)
@@ -933,7 +938,7 @@ def _blend(hex_color, intensity):
     g2 = int(255 + (g - 255) * intensity)
     b2 = int(255 + (b - 255) * intensity)
     return f"#{r2:02x}{g2:02x}{b2:02x}"
-
+ 
 def build_coverage_bar_html(sched_data, act_colors=None):
     """
     sched_data: {agent_name: {time_slot: activity}}
@@ -956,17 +961,17 @@ def build_coverage_bar_html(sched_data, act_colors=None):
     n_agents = len(sched_data)
     if n_agents == 0:
         return ""
-
+ 
     # Pre-compute per-slot counts for every activity
     slot_counts = {slot: {} for slot in TIME_SLOTS}
     for ag_slots in sched_data.values():
         for slot, act in ag_slots.items():
             if slot in slot_counts and act and act != ".":
                 slot_counts[slot][act] = slot_counts[slot].get(act, 0) + 1
-
+ 
     def count(slot, label):
         return slot_counts.get(slot, {}).get(label, 0)
-
+ 
     # ── Hour labels — every 30-min slot, compact format ───────────────────────
     hour_labels = ""
     for i, slot in enumerate(TIME_SLOTS):
@@ -981,7 +986,7 @@ def build_coverage_bar_html(sched_data, act_colors=None):
             f'padding-left:3px;line-height:20px;font-family:\'DM Sans\',sans-serif">'
             f'{label}</div>'
         )
-
+ 
     # ── Activity rows ──────────────────────────────────────────────────────────
     rows_html = ""
     for label, fg, bg in _dyn_rows:
@@ -1014,7 +1019,7 @@ def build_coverage_bar_html(sched_data, act_colors=None):
             </div>
             <div>{cells}</div>
         </div>"""
-
+ 
     # ── On-queue total (Chat + Phones) ─────────────────────────────────────────
     oq_cells = ""
     max_oq = max(
@@ -1042,7 +1047,7 @@ def build_coverage_bar_html(sched_data, act_colors=None):
         </div>
         <div>{oq_cells}</div>
     </div>"""
-
+ 
     # ── Total active (non-off, non-break) ──────────────────────────────────────
     ta_cells = ""
     max_ta = max(
@@ -1072,7 +1077,7 @@ def build_coverage_bar_html(sched_data, act_colors=None):
         </div>
         <div>{ta_cells}</div>
     </div>"""
-
+ 
     total_w = len(TIME_SLOTS) * SLOT_W
     return f"""
     <div style="border:1px solid #E2E8F0;border-radius:10px;overflow:hidden;
@@ -1091,9 +1096,9 @@ def build_coverage_bar_html(sched_data, act_colors=None):
             <div style="min-width:{AGENT_COL_W + total_w}px">{rows_html}</div>
         </div>
     </div>"""
-
+ 
 # ─── GLOBAL CSS ───────────────────────────────────────────────────────────────
-
+ 
 def _load_font_b64(filename):
     """Load a font file from the fonts/ folder next to app.py and return base64 string."""
     import base64 as _b64
@@ -1102,12 +1107,12 @@ def _load_font_b64(filename):
         return _b64.b64encode(font_path.read_bytes()).decode()
     except Exception:
         return None
-
+ 
 def inject_css():
     # ── Embed Cheltenham web fonts (brand-required) ────────────────────────────
     chelt_reg  = _load_font_b64("cheltenham_regular.woff2")
     chelt_bold = _load_font_b64("cheltenham_bold.woff2")
-
+ 
     font_faces = ""
     if chelt_reg:
         font_faces += f"""
@@ -1125,15 +1130,15 @@ def inject_css():
             font-style: normal;
             src: url("data:font/woff2;base64,{chelt_bold}") format("woff2");
         }}"""
-
+ 
     # DM Sans = approved Apercu Pro substitute for digital use
     gfonts_link = '<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">'
-
+ 
     st.markdown(gfonts_link, unsafe_allow_html=True)
     st.markdown(f"""<style>
     /* ── Framebridge brand: Cheltenham + DM Sans ── */
     {font_faces}
-
+ 
     /* ── CSS variables ── */
     :root {{
         --fb-black:      #1D2019;
@@ -1150,7 +1155,7 @@ def inject_css():
         --font-ui:       'DM Sans', Helvetica, Arial, sans-serif;
         --font-mono:     'DM Mono', 'Courier New', monospace;
     }}
-
+ 
     /* ── Chrome ── */
     #MainMenu, footer {{ visibility: hidden }}
     /* Hide header decorations but NOT the header itself (it contains sidebar expand button) */
@@ -1158,7 +1163,7 @@ def inject_css():
     [data-testid="stToolbar"] {{ display: none !important }}
     [data-testid="stStatusWidget"] {{ display: none !important }}
     header {{ background: transparent !important; border-bottom: none !important }}
-
+ 
     /* ── Lock sidebar permanently open — no collapse/expand toggle ── */
     section[data-testid="stSidebar"] {{
         width: 18rem !important;
@@ -1175,10 +1180,10 @@ def inject_css():
     }}
     [data-testid="stSidebarCollapseButton"],
     [data-testid="collapsedControl"] {{ display: none !important }}
-
+ 
     .stApp{{background:var(--fb-cream)!important}}
     div[data-testid="stMainBlockContainer"]{{padding:1.5rem 2rem}}
-
+ 
     /* ── Sidebar ── */
     [data-testid="stSidebar"]>div:first-child{{background:var(--fb-black)!important;padding-top:0}}
     [data-testid="stSidebar"] *{{color:#C8C5C0!important;font-family:var(--font-ui)!important}}
@@ -1197,12 +1202,12 @@ def inject_css():
     [data-testid="stSidebar"] .stRadio label[data-checked="true"] *{{
         color:white!important;font-weight:500!important}}
     [data-testid="stSidebar"] div[data-testid="stVerticalBlock"]{{gap:0!important}}
-
+ 
     /* ── Cards & containers ── */
     .scard{{
         background:white;border-radius:4px;padding:1.25rem;
         border:1px solid var(--fb-iron);margin-bottom:0}}
-
+ 
     /* ── Typography ── */
     .page-title{{
         font-size:24px;font-weight:bold;color:var(--fb-black);margin-bottom:4px;
@@ -1217,7 +1222,7 @@ def inject_css():
         font-size:11px;color:var(--fb-mist);margin-bottom:4px;
         font-family:var(--font-ui)!important;text-transform:uppercase;letter-spacing:0.08em}}
     .metric-sub{{font-size:11px;color:var(--fb-iron);margin-top:2px;font-family:var(--font-ui)!important}}
-
+ 
     /* ── Pills & badges ── */
     .team-pill{{
         display:inline-flex;align-items:center;gap:5px;padding:2px 10px;
@@ -1229,7 +1234,7 @@ def inject_css():
     .pill-pending{{background:#FEF3C7;color:#92400E}}
     .pill-approved{{background:#D1FAE5;color:#065F46}}
     .pill-denied{{background:#FEE2E2;color:#991B1B}}
-
+ 
     /* ── Request & agent rows ── */
     .req-row{{
         background:white;border:1px solid var(--fb-iron);border-radius:4px;
@@ -1238,7 +1243,7 @@ def inject_css():
         background:white;border:1px solid var(--fb-iron);border-radius:4px;
         padding:14px;height:100%;transition:box-shadow 0.15s}}
     .agent-card:hover{{box-shadow:0 2px 8px rgba(29,32,25,0.1)}}
-
+ 
     /* ── Buttons ── */
     .stButton button{{
         border-radius:4px!important;font-weight:600!important;
@@ -1251,12 +1256,12 @@ def inject_css():
     [data-testid="stButton"] button[kind="primary"]:hover,
     button[kind="primary"]:hover{{
         background:var(--fb-charcoal)!important}}
-
+ 
     /* ── Tabs ── */
     div[data-testid="stTabs"] button{{
         font-weight:500!important;font-family:var(--font-ui)!important;
         font-size:13px!important;letter-spacing:0.03em!important}}
-
+ 
     /* ── Inputs & selects ── */
     [data-testid="stTextInput"] input,
     [data-testid="stSelectbox"] div,
@@ -1266,29 +1271,29 @@ def inject_css():
         font-family:var(--font-ui)!important;font-size:12px!important;
         text-transform:uppercase!important;letter-spacing:0.06em!important;
         color:var(--fb-charcoal)!important}}
-
+ 
     /* ── Expanders & misc ── */
     [data-testid="stExpander"]{{border-radius:4px!important;border-color:var(--fb-iron)!important}}
     [data-testid="stExpander"] summary{{font-family:var(--font-ui)!important}}
     [data-testid="stToast"]{{font-family:var(--font-ui)!important}}
     </style>""", unsafe_allow_html=True)
-
+ 
 def metric(label, val, sub=""):
     st.markdown(f"""<div class="scard">
         <div class="metric-lbl">{label}</div>
         <div class="metric-num">{val}</div>
         {"<div class='metric-sub'>"+sub+"</div>" if sub else ""}
     </div>""", unsafe_allow_html=True)
-
+ 
 def team_pill(name, color):
     return f'<span class="team-pill" style="background:{color}22;color:{color}">{name}</span>'
-
+ 
 def status_pill(status):
     cls = {"Approved": "pill-approved", "Pending": "pill-pending", "Denied": "pill-denied"}.get(status, "")
     return f'<span class="status-pill {cls}">{status}</span>'
-
+ 
 # ─── SIDEBAR ──────────────────────────────────────────────────────────────────
-
+ 
 def sidebar():
     user = current_user()
     with st.sidebar:
@@ -1303,7 +1308,7 @@ def sidebar():
                 Framebridge
             </div>
         </div>""", unsafe_allow_html=True)
-
+ 
         # Logged-in user badge
         if user:
             role_colors = {"admin": "#EEE171", "editor": "#89AC9E", "viewer": "#979797"}
@@ -1322,9 +1327,9 @@ def sidebar():
                     <div style="font-size:10px;color:{rc};text-transform:capitalize">{user["role"]}</div>
                 </div>
             </div>""", unsafe_allow_html=True)
-
+ 
         pending = len(get_time_off_requests("Pending"))
-
+ 
         # Build nav based on role
         nav_labels = ["⬛  Schedule"]
         if can_edit() or True:   # Time Off visible to all (viewers submit their own)
@@ -1335,9 +1340,9 @@ def sidebar():
             nav_labels.append("👥  Users")
             nav_labels.append("⚙️  Settings")
         nav_labels.append("📊  Reports")
-
+ 
         page = st.radio("nav", nav_labels, label_visibility="collapsed")
-
+ 
         if pending and can_edit():
             st.markdown(f"""
             <div style="margin:12px 8px 0;padding:10px 12px;background:rgba(238,225,113,0.12);
@@ -1347,7 +1352,7 @@ def sidebar():
                 <div style="font-size:11px;color:#979797;margin-top:2px;font-family:'DM Sans',sans-serif">
                     Time off requests</div>
             </div>""", unsafe_allow_html=True)
-
+ 
         # Team legend
         teams = get_teams()
         if teams:
@@ -1360,24 +1365,24 @@ def sidebar():
                     <span style="font-size:12px;color:#CBD5E1">{t['name']}</span>
                     <span style="font-size:10px;color:#475569;margin-left:auto">{agents_on_team}</span>
                 </div>""", unsafe_allow_html=True)
-
+ 
         # Logout at the bottom
         st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
         if st.button("Sign out", use_container_width=True):
             st.session_state.pop("cx_user", None)
             st.rerun()
-
+ 
     page_key = page.split("  ")[1].split("  ")[0].strip()
     return page_key
-
+ 
 # ─── PAGE: SCHEDULE ───────────────────────────────────────────────────────────
-
+ 
 def page_schedule():
     st.markdown('<div class="page-title">Schedule</div>', unsafe_allow_html=True)
-
+ 
     today = datetime.date.today()
     default_mon = today - datetime.timedelta(days=today.weekday())
-
+ 
     c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.2, 1.2, 2])
     with c1:
         sel = st.date_input("Week starting (Monday)", value=default_mon, label_visibility="collapsed")
@@ -1404,13 +1409,13 @@ def page_schedule():
             n = apply_approved_timeoff(week_start)
             st.toast(f"Applied time off to {n} time slots.", icon="✅")
             st.rerun()
-
+ 
     # ── Template controls ─────────────────────────────────────────────────────
     if can_edit():
         all_templates = get_templates()
         with st.expander("📋  Templates", expanded=False):
             col_apply, col_save = st.columns(2)
-
+ 
             with col_apply:
                 st.markdown(
                     '<div style="font-family:\'DM Sans\',sans-serif;font-size:10px;'
@@ -1435,7 +1440,7 @@ def page_schedule():
                         st.rerun()
                 else:
                     st.caption("No templates yet — save one on the right.")
-
+ 
             with col_save:
                 st.markdown(
                     '<div style="font-family:\'DM Sans\',sans-serif;font-size:10px;'
@@ -1459,20 +1464,20 @@ def page_schedule():
                                 u["display_name"] if u else "",
                             )
                             st.toast(msg, icon="✅" if ok else "⚠️")
-
+ 
     st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
-
+ 
     day_tabs = st.tabs([
         f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
         for i, d in enumerate(DAYS)
     ])
-
+ 
     agents_all  = get_agents()
     teams       = get_teams()
     team_colors = {t["name"]: t["color"] for t in teams}
     act_names   = get_activity_names()   # dynamic from DB
     act_colors  = get_act_colors()       # dynamic from DB
-
+ 
     for di, (tab, day_name) in enumerate(zip(day_tabs, DAYS)):
         with tab:
             # Load saved schedule data for all agents on this day
@@ -1480,7 +1485,7 @@ def page_schedule():
             for ag in agents_all:
                 df_tmp = get_schedule_df(week_start, di, [ag["name"]])
                 sched_data[ag["name"]] = df_tmp[ag["name"]].to_dict()
-
+ 
             # ── Coverage bar — always visible at the top ───────────────────────
             if agents_all:
                 n_scheduled = sum(
@@ -1507,14 +1512,14 @@ def page_schedule():
                     st.markdown(cov_html, unsafe_allow_html=True)
                 else:
                     st.caption("No schedule data yet — use the Edit tab to build this day's schedule.")
-
+ 
             tab_list = ["👁  Timeline view"]
             if can_edit():
                 tab_list.append("✏️  Edit schedule")
             tabs_out = st.tabs(tab_list)
             view_tab = tabs_out[0]
             edit_tab = tabs_out[1] if can_edit() else None
-
+ 
             with view_tab:
                 if not agents_all:
                     st.info("Add agents in the Roster page to see the schedule.")
@@ -1524,7 +1529,7 @@ def page_schedule():
                          "color": team_colors.get(a["team_name"], "#64748B")}
                         for a in agents_all
                     ]
-
+ 
                     # ── Team order (persisted in session state) ───────────────
                     teams_with_agents = [t for t in teams
                                          if any(a["team_name"] == t["name"] for a in agents_info)]
@@ -1538,18 +1543,18 @@ def page_schedule():
                         _new   = [t["name"] for t in teams_with_agents
                                   if t["name"] not in set(_saved)]
                         st.session_state[_tl_order_key] = _saved + _new
-
+ 
                     _team_lookup  = {t["name"]: t for t in teams}
                     _ordered_teams = [_team_lookup[n] for n in st.session_state[_tl_order_key]
                                       if n in _team_lookup]
-
+ 
                     # Group by team with headers + reorder buttons
                     n_rows = len(TIME_SLOTS) * 26 + 60
                     for _i, team in enumerate(_ordered_teams):
                         team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
                         if not team_agents:
                             continue
-
+ 
                         # Header row: dot + name + agent count + ↑ ↓ buttons
                         _hcol, _ucol, _dcol = st.columns([30, 1, 1])
                         with _hcol:
@@ -1582,12 +1587,12 @@ def page_schedule():
                                 _idx   = _order.index(team["name"])
                                 _order[_idx], _order[_idx + 1] = _order[_idx + 1], _order[_idx]
                                 st.rerun()
-
+ 
                         team_sched = {a["name"]: sched_data.get(a["name"], {}) for a in team_agents}
                         timeline_html = build_timeline_html(team_agents, team_sched, act_colors)
                         st_components.html(timeline_html, height=min(n_rows, 680), scrolling=True)
                         st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
-
+ 
             if can_edit() and edit_tab is not None:
               with edit_tab:
                 # ── Quick Fill ──────────────────────────────────────────────────
@@ -1631,7 +1636,7 @@ def page_schedule():
                         type="primary", use_container_width=True,
                     )
                 st.markdown("</div>", unsafe_allow_html=True)
-
+ 
                 if qf_go:
                     fi = TIME_SLOTS.index(qf_from)
                     ti = TIME_SLOTS.index(qf_to)
@@ -1654,7 +1659,7 @@ def page_schedule():
                             icon="✅",
                         )
                         st.rerun()
-
+ 
                 # ── Per-team grid editor ────────────────────────────────────────
                 for team in teams:
                     team_agents = [a["name"] for a in agents_all if a["team_name"] == team["name"]]
@@ -1690,22 +1695,22 @@ def page_schedule():
                         save_schedule_df(week_start, di, edited)
                         st.toast(f"Saved {team['name']} for {day_name}.", icon="✅")
                         st.rerun()
-
-
+ 
+ 
 # ─── PAGE: TIME OFF ───────────────────────────────────────────────────────────
-
+ 
 def page_timeoff():
     st.markdown('<div class="page-title">Time Off</div>', unsafe_allow_html=True)
-
+ 
     # ── Viewer-only mode ───────────────────────────────────────────────────────
     if not can_edit():
         user = current_user()
         my_name = user["display_name"] if user else ""
         all_reqs = get_time_off_requests()
         my_reqs  = [r for r in all_reqs if r["agent_name"] == my_name]
-
+ 
         tab_mine, tab_submit = st.tabs(["My requests", "Submit request"])
-
+ 
         with tab_mine:
             if not my_reqs:
                 st.info("You have no time-off requests on file.")
@@ -1723,7 +1728,7 @@ def page_timeoff():
                         </div>
                         {status_pill(req["status"])}
                     </div>""", unsafe_allow_html=True)
-
+ 
         with tab_submit:
             agents_list = get_agent_names()
             default_idx = agents_list.index(my_name) if my_name in agents_list else 0
@@ -1743,11 +1748,11 @@ def page_timeoff():
                         st.success("Request submitted — your manager will review it soon.")
         return
     # ── Admin / Editor mode ────────────────────────────────────────────────────
-
+ 
     all_reqs = get_time_off_requests()
     pending  = [r for r in all_reqs if r["status"] == "Pending"]
     approved = [r for r in all_reqs if r["status"] == "Approved"]
-
+ 
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric("Pending review", len(pending), "need your action")
     with c2: metric("Approved", len(approved))
@@ -1757,13 +1762,13 @@ def page_timeoff():
         upcoming = [r for r in approved
                     if datetime.date.fromisoformat(r["end_date"]) >= today]
         metric("Upcoming (approved)", len(upcoming), "not yet passed")
-
+ 
     st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
-
+ 
     tab_pending, tab_all, tab_submit = st.tabs([
         f"⚠️  Pending ({len(pending)})", "All requests", "Submit request"
     ])
-
+ 
     with tab_pending:
         if not pending:
             st.success("You're all caught up — no pending requests.")
@@ -1773,7 +1778,7 @@ def page_timeoff():
             days = (e - s).days + 1
             agent_team = next((a["team_name"] for a in get_agents() if a["name"] == req["agent_name"]), req.get("team_name", ""))
             tcolor = get_team_color(agent_team)
-
+ 
             st.markdown(f"""<div class="req-row">
                 <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
                     <div style="width:32px;height:32px;border-radius:50%;background:{tcolor}22;color:{tcolor};
@@ -1794,7 +1799,7 @@ def page_timeoff():
                     {"&nbsp;·&nbsp; <i>"+req['notes']+"</i>" if req["notes"] else ""}
                 </div>
             </div>""", unsafe_allow_html=True)
-
+ 
             ca, cb, _ = st.columns([1, 1, 5])
             with ca:
                 if st.button("✅ Approve", key=f"ap_{req['id']}", use_container_width=True, type="primary"):
@@ -1806,7 +1811,7 @@ def page_timeoff():
                     update_request_status(req["id"], "Denied")
                     st.toast("Request denied.", icon="🚫")
                     st.rerun()
-
+ 
     with tab_all:
         if not all_reqs:
             st.info("No requests yet.")
@@ -1828,7 +1833,7 @@ def page_timeoff():
                     </div>
                     {status_pill(req["status"])}
                 </div>""", unsafe_allow_html=True)
-
+ 
     with tab_submit:
         agents_list = get_agent_names()
         if not agents_list:
@@ -1848,19 +1853,19 @@ def page_timeoff():
                         ag_data = next((a for a in get_agents() if a["name"]==agent), {})
                         add_time_off_request(agent, ag_data.get("team_name",""), start, end, rtype, notes)
                         st.success(f"Request submitted for {agent}.")
-
-
+ 
+ 
 # ─── PAGE: ROSTER ─────────────────────────────────────────────────────────────
-
+ 
 def page_roster():
     st.markdown('<div class="page-title">Roster</div>', unsafe_allow_html=True)
-
+ 
     teams = get_teams()
     team_names = [t["name"] for t in teams]
     team_colors_map = {t["name"]: t["color"] for t in teams}
-
+ 
     add_tab, view_tab = st.tabs(["All agents", "Add agent"])
-
+ 
     with view_tab:
         st.subheader("Add new agent")
         with st.form("add_agent_form"):
@@ -1883,7 +1888,7 @@ def page_roster():
                     st.success(msg) if ok else st.error(msg)
                     if ok:
                         st.rerun()
-
+ 
     with add_tab:
         agents = get_agents()
         if not agents:
@@ -1936,7 +1941,7 @@ def page_roster():
                                     delete_agent(ag["id"])
                                     st.toast(f"Removed {ag['name']}.", icon="🗑️")
                                     st.rerun()
-
+ 
         # Unassigned agents
         known_teams = set(team_names)
         unassigned = [a for a in agents if a["team_name"] not in known_teams]
@@ -1950,17 +1955,17 @@ def page_roster():
                             upsert_agent(ag["name"], new_team, ag["employment_type"],
                                          ag["weekly_hours"], ag["work_days"], ag.get("notes",""), ag["id"])
                             st.rerun()
-
-
+ 
+ 
 # ─── PAGE: TEAMS ──────────────────────────────────────────────────────────────
-
+ 
 def page_teams():
     st.markdown('<div class="page-title">Teams</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-sub">Create and manage teams. Each team gets its own color used throughout the app.</div>', unsafe_allow_html=True)
-
+ 
     teams = get_teams()
     agents = get_agents()
-
+ 
     # Existing teams
     if teams:
         cols = st.columns(min(len(teams), 3))
@@ -1996,7 +2001,7 @@ def page_teams():
                                     delete_team(team["id"])
                                     st.toast(f"Deleted team {team['name']}.", icon="🗑️")
                                     st.rerun()
-
+ 
     st.divider()
     st.subheader("Create new team")
     with st.form("new_team"):
@@ -2011,7 +2016,7 @@ def page_teams():
                 ok, msg = upsert_team(name.strip(), color, desc)
                 st.success(msg) if ok else st.error(msg)
                 if ok: st.rerun()
-
+ 
     if teams:
         st.markdown("""
         <div style="background:#FFFBDE;border:1px solid #EEE171;border-radius:4px;
@@ -2020,17 +2025,17 @@ def page_teams():
             <b style="color:#1D2019">Tip:</b> Deleting a team is only allowed when no agents are assigned to it.
             Go to the Roster page to reassign agents before deleting a team.
         </div>""", unsafe_allow_html=True)
-
-
+ 
+ 
 # ─── PAGE: TEMPLATES ─────────────────────────────────────────────────────────
-
+ 
 def _template_editor(template_id):
     """Inline template editor — same look as the schedule editor but bound to a template."""
     tmpl = get_template(template_id)
     if not tmpl:
         st.session_state.pop("editing_template_id", None)
         st.rerun()
-
+ 
     # ── Header ────────────────────────────────────────────────────────────────
     hc1, hc2 = st.columns([5, 1])
     with hc1:
@@ -2055,7 +2060,7 @@ def _template_editor(template_id):
         if st.button("← All templates", use_container_width=True):
             st.session_state.pop("editing_template_id", None)
             st.rerun()
-
+ 
     # ── Rename / edit meta ────────────────────────────────────────────────────
     with st.expander("Rename / edit description"):
         with st.form(f"rename_tmpl_{template_id}"):
@@ -2069,18 +2074,18 @@ def _template_editor(template_id):
                 st.toast(msg, icon="✅" if ok else "⚠️")
                 if ok:
                     st.rerun()
-
+ 
     st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-
+ 
     # ── Day tabs ──────────────────────────────────────────────────────────────
     agents_all  = get_agents()
     teams       = get_teams()
     team_colors = {t["name"]: t["color"] for t in teams}
     act_names   = get_activity_names()
     act_colors  = get_act_colors()
-
+ 
     day_tabs = st.tabs(DAYS)
-
+ 
     for di, (tab, day_name) in enumerate(zip(day_tabs, DAYS)):
         with tab:
             # Load template schedule for this day
@@ -2088,16 +2093,16 @@ def _template_editor(template_id):
             for ag in agents_all:
                 df_tmp = get_template_df(template_id, di, [ag["name"]])
                 sched_data[ag["name"]] = df_tmp[ag["name"]].to_dict()
-
+ 
             # Coverage bar
             cov_html = build_coverage_bar_html(sched_data, act_colors)
             if cov_html:
                 st.markdown(cov_html, unsafe_allow_html=True)
             else:
                 st.caption("No schedule data yet — use the Edit tab below.")
-
+ 
             view_tab, edit_tab = st.tabs(["👁  Timeline view", "✏️  Edit"])
-
+ 
             with view_tab:
                 if not agents_all:
                     st.info("Add agents in the Roster page to see the template.")
@@ -2118,17 +2123,17 @@ def _template_editor(template_id):
                         _saved = [n for n in st.session_state[_tl_order_key] if n in _cur]
                         _new   = [t["name"] for t in teams_with_agents if t["name"] not in set(_saved)]
                         st.session_state[_tl_order_key] = _saved + _new
-
+ 
                     _team_lookup   = {t["name"]: t for t in teams}
                     _ordered_teams = [_team_lookup[n] for n in st.session_state[_tl_order_key]
                                       if n in _team_lookup]
                     n_rows = len(TIME_SLOTS) * 26 + 60
-
+ 
                     for _i, team in enumerate(_ordered_teams):
                         team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
                         if not team_agents:
                             continue
-
+ 
                         _hcol, _ucol, _dcol = st.columns([30, 1, 1])
                         with _hcol:
                             st.markdown(
@@ -2152,14 +2157,14 @@ def _template_editor(template_id):
                                 _idx   = _order.index(team["name"])
                                 _order[_idx], _order[_idx + 1] = _order[_idx + 1], _order[_idx]
                                 st.rerun()
-
+ 
                         team_sched = {a["name"]: sched_data.get(a["name"], {}) for a in team_agents}
                         st_components.html(
                             build_timeline_html(team_agents, team_sched, act_colors),
                             height=min(n_rows, 680), scrolling=True
                         )
                         st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
-
+ 
             with edit_tab:
                 # ── Quick Fill ────────────────────────────────────────────────
                 st.markdown(
@@ -2191,7 +2196,7 @@ def _template_editor(template_id):
                     tqf_go = st.button("Apply", key=f"tqf_apply_{template_id}_{di}",
                                        type="primary", use_container_width=True)
                 st.markdown("</div>", unsafe_allow_html=True)
-
+ 
                 if tqf_go:
                     fi = TIME_SLOTS.index(tqf_from)
                     ti = TIME_SLOTS.index(tqf_to)
@@ -2207,7 +2212,7 @@ def _template_editor(template_id):
                             save_template_df(template_id, di, df_tmp)
                         st.toast(f"Set {tqf_act} for {len(tgts)} agent(s).", icon="✅")
                         st.rerun()
-
+ 
                 # ── Per-team grids ────────────────────────────────────────────
                 for team in teams:
                     team_agents = [a["name"] for a in agents_all
@@ -2240,27 +2245,27 @@ def _template_editor(template_id):
                         save_template_df(template_id, di, edited)
                         st.toast(f"Saved {team['name']} for {day_name}.", icon="✅")
                         st.rerun()
-
-
+ 
+ 
 def page_templates():
     if not can_edit():
         st.warning("Editor access required.")
         return
-
+ 
     # Route to editor if one is selected
     if st.session_state.get("editing_template_id"):
         _template_editor(st.session_state["editing_template_id"])
         return
-
+ 
     st.markdown('<div class="page-title">Templates</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="page-sub">Build reusable weekly schedules. '
         'Apply any template to a week from the Schedule page, then adjust as needed.</div>',
         unsafe_allow_html=True,
     )
-
+ 
     templates = get_templates()
-
+ 
     if not templates:
         st.markdown(
             '<div style="background:#F0F5F3;border:1px solid #C4D9D2;border-radius:4px;'
@@ -2308,14 +2313,14 @@ def page_templates():
                         delete_template(tmpl["id"])
                         st.toast(f"Deleted '{tmpl['name']}'.", icon="🗑️")
                         st.rerun()
-
+ 
     st.divider()
     st.markdown(
         '<div style="font-family:\'Cheltenham\',Georgia,serif;font-size:16px;'
         'font-weight:bold;color:#1D2019;margin-bottom:12px">Create new template</div>',
         unsafe_allow_html=True,
     )
-
+ 
     with st.form("create_template_form"):
         nc1, nc2 = st.columns(2)
         with nc1:
@@ -2338,20 +2343,20 @@ def page_templates():
                     st.rerun()
                 else:
                     st.error(msg)
-
-
+ 
+ 
 # ─── PAGE: SETTINGS ──────────────────────────────────────────────────────────
-
+ 
 def page_settings():
     if not is_admin():
         st.warning("Admin access required.")
         return
-
+ 
     st.markdown('<div class="page-title">Settings</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-sub">Add and color-code the activity types that appear in the schedule editor.</div>', unsafe_allow_html=True)
-
+ 
     acts = get_activities()
-
+ 
     # ── Color palette preview ──────────────────────────────────────────────────
     st.markdown('<div style="font-size:13px;font-weight:600;color:#0F172A;margin-bottom:8px">Current activity palette</div>', unsafe_allow_html=True)
     pills = "".join(
@@ -2362,11 +2367,11 @@ def page_settings():
         for a in acts
     )
     st.markdown(f'<div style="line-height:2;margin-bottom:20px">{pills}</div>', unsafe_allow_html=True)
-
+ 
     # ── Edit existing activities ───────────────────────────────────────────────
     st.markdown('<div style="font-size:13px;font-weight:600;color:#0F172A;margin-bottom:4px">Edit activity types</div>', unsafe_allow_html=True)
     st.caption("Change the name or colors of any activity. Changes apply immediately to the schedule view.")
-
+ 
     for act in acts:
         bg_cur, fg_cur = act["bg_color"], act["fg_color"]
         with st.expander(act["name"], expanded=False):
@@ -2387,7 +2392,7 @@ def page_settings():
                 with c3:
                     new_fg = st.color_picker("Text color", act["fg_color"],
                                              help="Label text color")
-
+ 
                 cs, cd = st.columns(2)
                 with cs:
                     if st.form_submit_button("Save changes", use_container_width=True, type="primary"):
@@ -2400,11 +2405,11 @@ def page_settings():
                         delete_activity_db(act["id"])
                         st.toast(f"Deleted '{act['name']}'.", icon="🗑️")
                         st.rerun()
-
+ 
     # ── Add new activity ───────────────────────────────────────────────────────
     st.divider()
     st.markdown('<div style="font-size:13px;font-weight:600;color:#0F172A;margin-bottom:4px">Add a new activity type</div>', unsafe_allow_html=True)
-
+ 
     with st.form("new_activity"):
         c1, c2, c3 = st.columns([3, 1, 1])
         with c1:
@@ -2415,7 +2420,7 @@ def page_settings():
         with c3:
             new_fg2 = st.color_picker("Text color", "#3730A3",
                                       help="The label text color")
-
+ 
         # Preview (static — shows the default until saved)
         st.markdown(
             '<div style="font-size:11px;color:#94A3B8;margin-top:4px">'
@@ -2430,7 +2435,7 @@ def page_settings():
                 st.success(msg) if ok else st.error(msg)
                 if ok:
                     st.rerun()
-
+ 
     # ── Color tips ─────────────────────────────────────────────────────────────
     st.markdown("""
     <div style="background:#F0F5F3;border:1px solid #C4D9D2;border-radius:4px;
@@ -2440,18 +2445,18 @@ def page_settings():
         and a dark shade of the same hue as the text color (e.g. #1E40AF).
         This ensures cells are readable in both the timeline and the editor grid.
     </div>""", unsafe_allow_html=True)
-
-
+ 
+ 
 # ─── PAGE: USERS ──────────────────────────────────────────────────────────────
-
+ 
 def page_users():
     if not is_admin():
         st.warning("Admin access required.")
         return
-
+ 
     st.markdown('<div class="page-title">Users</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-sub">Manage who can access the scheduler and what they can do.</div>', unsafe_allow_html=True)
-
+ 
     users = list_users()
     role_colors = {"admin": "#FBBF24", "editor": "#60A5FA", "viewer": "#94A3B8"}
     role_descs  = {
@@ -2459,9 +2464,9 @@ def page_users():
         "editor": "Edit schedules and approve time off, but cannot manage users",
         "viewer": "Read-only schedule + submit own time-off requests",
     }
-
+ 
     st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:12px">Current users</div>', unsafe_allow_html=True)
-
+ 
     for u in users:
         rc = role_colors.get(u["role"], "#94A3B8")
         initials = "".join(p[0] for p in (u["display_name"] or u["username"]).split()[:2]).upper()
@@ -2478,10 +2483,10 @@ def page_users():
                     <div style="font-size:12px;color:#94A3B8">@{u["username"]} · {role_descs.get(u["role"],"")}</div>
                 </div>
             </div>""", unsafe_allow_html=True)
-
+ 
             cu = current_user()
             is_self = cu and cu["id"] == u["id"]
-
+ 
             with st.form(f"edit_user_{u['id']}"):
                 c1, c2 = st.columns(2)
                 with c1:
@@ -2495,7 +2500,7 @@ def page_users():
                                          disabled=is_self,
                                          help="Inactive users cannot sign in.")
                 new_pw = st.text_input("New password (leave blank to keep current)", type="password")
-
+ 
                 cs, cd = st.columns(2)
                 with cs:
                     if st.form_submit_button("Save changes", use_container_width=True):
@@ -2511,10 +2516,10 @@ def page_users():
                         delete_user_db(u["id"])
                         st.toast(f"Deleted user {u['username']}.", icon="🗑️")
                         st.rerun()
-
+ 
     st.divider()
     st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:12px">Create new user</div>', unsafe_allow_html=True)
-
+ 
     with st.form("new_user"):
         c1, c2 = st.columns(2)
         with c1: new_uname = st.text_input("Username", placeholder="e.g. jsmith")
@@ -2533,7 +2538,7 @@ def page_users():
                 ok, msg = create_user(new_uname, new_pw2, new_dname, new_role2)
                 st.success(msg) if ok else st.error(msg)
                 if ok: st.rerun()
-
+ 
     st.markdown(f"""
     <div style="background:#F0F5F3;border:1px solid #C4D9D2;border-radius:4px;
                 padding:12px 16px;margin-top:16px;font-size:12px;color:#484848;
@@ -2543,13 +2548,13 @@ def page_users():
         <b>editor</b> — {role_descs["editor"]}<br>
         <b>viewer</b> — {role_descs["viewer"]}
     </div>""", unsafe_allow_html=True)
-
-
+ 
+ 
 # ─── PAGE: REPORTS ────────────────────────────────────────────────────────────
-
+ 
 def page_reports():
     st.markdown('<div class="page-title">Reports</div>', unsafe_allow_html=True)
-
+ 
     agents      = get_agents()
     teams       = get_teams()
     dyn_colors  = get_act_colors()
@@ -2557,7 +2562,7 @@ def page_reports():
     today   = datetime.date.today()
     monday  = today - datetime.timedelta(days=today.weekday())
     week_end = monday + datetime.timedelta(days=6)
-
+ 
     # PTO days this week
     pto_days = sum(
         (min(datetime.date.fromisoformat(r["end_date"]), week_end)
@@ -2566,17 +2571,17 @@ def page_reports():
         and datetime.date.fromisoformat(r["start_date"]) <= week_end
         and datetime.date.fromisoformat(r["end_date"]) >= monday
     )
-
+ 
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric("Total agents", len(agents))
     with c2: metric("Teams", len(teams))
     with c3: metric("PTO days this week", max(0, pto_days))
     with c4: metric("Pending approvals", len([r for r in all_req if r["status"]=="Pending"]))
-
+ 
     st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
-
+ 
     c_left, c_right = st.columns(2)
-
+ 
     with c_left:
         st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:8px">Agents by team</div>', unsafe_allow_html=True)
         for team in teams:
@@ -2592,7 +2597,7 @@ def page_reports():
                     <div style="background:{team['color']};width:{pct}%;height:100%;border-radius:99px"></div>
                 </div>
             </div>""", unsafe_allow_html=True)
-
+ 
     with c_right:
         st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:8px">Time off by type</div>', unsafe_allow_html=True)
         if all_req:
@@ -2608,10 +2613,10 @@ def page_reports():
                 </div>""", unsafe_allow_html=True)
         else:
             st.caption("No requests yet.")
-
+ 
     st.markdown('<div style="height:20px"></div>', unsafe_allow_html=True)
     st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:8px">Recent time off requests</div>', unsafe_allow_html=True)
-
+ 
     recent = sorted(all_req, key=lambda r: r["submitted_date"], reverse=True)[:10]
     if recent:
         df_show = pd.DataFrame([{
@@ -2626,21 +2631,21 @@ def page_reports():
         st.dataframe(df_show, use_container_width=True, hide_index=True)
     else:
         st.caption("No requests recorded yet.")
-
-
+ 
+ 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-
+ 
 def main():
     init_db()
     inject_css()
-
+ 
     # ── Login gate ─────────────────────────────────────────────────────────────
     if not current_user():
         show_login()
         return   # show_login calls st.stop() but return is here for clarity
-
+ 
     page = sidebar()
-
+ 
     page_map = {
         "Schedule":  page_schedule,
         "Time Off":  page_timeoff,
@@ -2654,6 +2659,6 @@ def main():
     fn = page_map.get(page)
     if fn:
         fn()
-
+ 
 if __name__ == "__main__":
     main()
