@@ -757,7 +757,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
     _ON_QUEUE_LOCAL = {"Chat", "Phones"}
 
     TIME_COL_W  = 54   # px — left time-label column
-    AGENT_COL_W = 82   # px — each agent column
+    AGENT_COL_W = 96   # px — each agent column
     ROW_H       = 26   # px — each time-slot row
     FONT        = "'DM Sans','Apercu Pro',Helvetica,Arial,sans-serif"
 
@@ -830,7 +830,7 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
                 active_count += 1
             if act in _ON_QUEUE_LOCAL:
                 queue_count += 1
-            lbl = "" if act == "." else act[:5]
+            lbl = "" if act == "." else act
             agent_tds += (
                 f'<td title="{ag["name"]}: {act}" style="'
                 f'background:{c_bg};color:{c_fg};'
