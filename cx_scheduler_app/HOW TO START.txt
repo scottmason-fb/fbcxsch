@@ -1,0 +1,97 @@
+CX SCHEDULER — HOW TO START
+════════════════════════════════════════════════
+
+FIRST TIME SETUP (one-time, takes 2 minutes)
+────────────────────────────────────────────
+1. Make sure Python is installed on your Mac.
+   Check by opening Terminal and typing:  python3 --version
+   If you see a version number, you're good.
+   If not, download Python free from:  https://www.python.org/downloads/
+   (Click the yellow "Download Python" button, open the installer, click through.)
+
+2. On first launch, your Mac may say "START APP.command cannot be opened
+   because it is from an unidentified developer."
+
+   To fix this:
+   → Right-click (or Control-click) the "START APP.command" file
+   → Click "Open"
+   → Click "Open" again in the popup
+
+   You only need to do this once.
+
+
+LAUNCHING THE APP (every time after that)
+────────────────────────────────────────────
+Double-click "START APP.command" — the app opens in your browser automatically.
+A small terminal window stays open in the background (that's normal, don't close it).
+To stop the app: close the terminal window or press Control + C inside it.
+
+
+SIGNING IN
+────────────────────────────────────────────
+The app requires a login. The default admin account is:
+  Username:  admin
+  Password:  admin
+
+Sign in, then go to the Users page to:
+  • Change the admin password
+  • Create accounts for your team (editors or viewers)
+  • Editors can build/edit schedules and approve time off
+  • Viewers (agents) see the read-only schedule and can submit time-off requests
+
+To share the app with agents, follow the "Sharing" section below
+and give each agent their own viewer account.
+
+
+USING THE APP
+────────────────────────────────────────────
+Schedule tab
+  • Coverage bar at the top of each day shows live counts (Chat, Phones, etc.)
+    and updates every time you save.
+  • Edit Schedule tab → Quick Fill: pick an activity, a time range, and an agent
+    (or "All agents"), then click Apply to fill many slots at once.
+  • Edit Schedule tab → team grids: change individual slots with the dropdowns,
+    then click Save for that team.
+  • Timeline view tab: read-only visual of the full day, grouped by team.
+
+Time Off tab
+  • Review and approve/deny pending requests.
+  • Submit new requests on behalf of agents.
+  • Click "Apply approved time off" on the Schedule page to auto-fill approved
+    time off into the weekly schedule.
+
+Roster tab
+  • Add, edit, or remove agents. Set team, hours, and work days.
+
+Teams tab
+  • Create new teams, change team colors, or delete empty teams.
+
+Reports tab
+  • Weekly coverage summary and time-off breakdown.
+
+
+SHARING WITH YOUR TEAM (optional — free)
+────────────────────────────────────────────
+Option A — Same office/Wi-Fi network:
+  Run the app, then find your Mac's IP address (System Settings → Wi-Fi → Details).
+  Share the URL:  http://YOUR-IP-ADDRESS:8501
+  Works as long as your Mac is running the app.
+
+Option B — Anywhere, free hosting:
+  1. Create a free GitHub account at https://github.com
+  2. Upload this folder as a new repository
+  3. Go to https://streamlit.io/cloud, sign in with GitHub
+  4. Click "New app", select your repo, set main file to "app.py", click Deploy
+  5. You get a permanent URL (like https://yourapp.streamlit.app) to share with anyone
+
+
+YOUR DATA
+────────────────────────────────────────────
+All schedule data, agents, teams, and time-off requests are saved in:
+  cx_scheduler.db  (in this same folder)
+
+Back this file up regularly — it has your full history.
+If you move the app to a new computer, copy the entire folder including cx_scheduler.db.
+
+
+════════════════════════════════════════════════
