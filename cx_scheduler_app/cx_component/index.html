@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 11px; background: #fff; }
+
+/* ── Toolbar ── */
+#toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 5px 8px; background: #F8FAFC;
+  border-bottom: 2px solid #E2E8F0;
+  height: 40px; flex-shrink: 0;
+}
+#save-btn {
+  background: #1e40af; color: #fff; border: none;
+  padding: 4px 13px; border-radius: 5px; cursor: pointer;
+  font-size: 11px; font-weight: 700;
+}
+#save-btn:hover { background: #1d4ed8; }
+#status { font-size: 11px; color: #94a3b8; }
+#status.dirty { color: #f59e0b; font-weight: 600; }
+#status.saved { color: #16a34a; font-weight: 600; }
+.toolbar-spacer { flex: 1; }
+#hint { font-size: 10px; color: #94a3b8; }
+#clear-btn {
+  background: #fff; color: #dc2626; border: 1.5px solid #fca5a5;
+  padding: 4px 11px; border-radius: 5px; cursor: pointer;
+  font-size: 11px; font-weight: 700;
+}
+#clear-btn:hover { background: #fef2f2; border-color: #dc2626; }
+
+/* ── Main body: table + counts side panel ── */
+#body {
+  display: flex;
+}
+
+/* ── Table wrapper ── */
+#wrap {
+  flex: 1; overflow-x: auto; overflow-y: visible; min-width: 0;
+}
+
+/* ── Count panel (right side) ── */
+#cpanel {
+  width: 144px; flex-shrink: 0;
+  overflow: hidden;
+  border-left: 2px solid #CBD5E1;
+  display: flex; flex-direction: column;
+}
+#cpanel-hdr {
+  position: sticky; top: 0; z-index: 20;
+  background: #F1F5F9; border-bottom: 1px solid #CBD5E1;
+  display: flex; height: 30px; align-items: center;
+}
+#cpanel-hdr .ht {
+  width: 68px; flex-shrink: 0;
+  text-align: right; padding-right: 5px;
+  font-size: 10px; font-weight: 700; color: #64748B;
+  border-right: 1px solid #CBD5E1;
+}
+#cpanel-hdr .hc {
+  flex: 1; text-align: center;
+  font-size: 10px; font-weight: 700; color: #1d4ed8;
+}
+#cpanel-hdr .hp {
+  flex: 1; text-align: center;
+  font-size: 10px; font-weight: 700; color: #065f46;
+}
+#cpanel-rows { flex: 1; overflow: hidden; }
+#cpanel-rows table {
+  border-collapse: collapse; width: 100%; table-layout: fixed;
+}
+#cpanel-rows col.c-time  { width: 68px; }
+#cpanel-rows col.c-chat  { width: 38px; }
+#cpanel-rows col.c-phone { width: 38px; }
+
+/* Count panel — time label cells (mirror left column) */
+#cpanel-rows td.ct {
+  height: 25px;
+  font-size: 10px; color: #64748B; font-weight: 500;
+  text-align: right; white-space: nowrap;
+  background: #F8FAFC;
+  padding: 0 5px;
+  border: 1px solid #CBD5E1;
+  border-left: none;
+  vertical-align: middle;
+}
+/* Count panel — number cells */
+#cpanel-rows td.cc, #cpanel-rows td.cp {
+  height: 25px;
+  text-align: center; font-size: 10px; font-weight: 700;
+  border: 1px solid #CBD5E1; border-left: none;
+  vertical-align: middle;
+}
+#cpanel-rows td.cc { color: #1d4ed8; background: #EFF6FF; }
+#cpanel-rows td.cp { color: #065f46; background: #F0FDF4; }
+td.cc.hi { background: #BFDBFE; }
+td.cp.hi { background: #BBF7D0; }
+
+/* Hour-break rows — stronger top border every 2 rows (= every 1 hr) */
+#cpanel-rows tr.hr td { border-top: 2px solid #94A3B8 !important; }
+
+/* ── Table ── */
+table { border-collapse: collapse; table-layout: fixed; }
+
+thead th {
+  background: #F1F5F9; border: 1px solid #CBD5E1;
+  padding: 3px 2px; font-size: 10px; font-weight: 700;
+  text-align: center; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  position: sticky; top: 0; z-index: 20;
+  min-width: 90px; width: 90px;
+}
+thead th.th-time {
+  min-width: 66px; width: 66px;
+  left: 0; z-index: 30;
+}
+
+/* ── Time cells ── */
+td.tc {
+  border: 1px solid #CBD5E1;
+  padding: 0 5px; height: 25px;
+  font-size: 10px; color: #64748B; font-weight: 500;
+  text-align: right; white-space: nowrap;
+  background: #F8FAFC;
+  position: sticky; left: 0; z-index: 10;
+}
+
+/* ── Data cells ── */
+td.dc {
+  border: 1px solid #CBD5E1;
+  height: 25px; padding: 0;
+  position: relative;
+  user-select: none;
+}
+td.dc.changed { outline: 2px solid #3b82f6 inset; }
+td.dc.fp      { outline: 2px dashed #1d4ed8 inset; background: rgba(29,78,216,0.07) !important; }
+
+/* Hour-break rows — thicker top border on all cells */
+tr.hr td.tc,
+tr.hr td.dc { border-top: 2px solid #94A3B8 !important; }
+
+/* ── Select ── */
+td.dc select {
+  width: 100%; height: 100%;
+  border: none; background: transparent;
+  font-size: 10px; font-weight: 600;
+  cursor: pointer; padding: 0 16px 0 3px;
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%2394a3b8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 3px center;
+  background-size: 7px;
+}
+td.dc select:focus { outline: none; }
+
+/* ── Fill handle ── */
+.fh {
+  position: absolute; bottom: 1px; right: 1px;
+  width: 8px; height: 8px;
+  background: #2563eb; border: 1px solid #fff;
+  border-radius: 1px; cursor: crosshair; z-index: 6;
+  transition: transform .1s;
+}
+.fh:hover { transform: scale(1.4); background: #1d4ed8; }
+
+body.dragging td.dc select { pointer-events: none; }
+body.dragging { cursor: crosshair; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <button id="save-btn">💾 Save Schedule</button>
+  <span id="status">No changes</span>
+  <span class="toolbar-spacer"></span>
+  <span id="hint">Drag ◼ to fill · ↕ column · ↔ row</span>
+  <button id="clear-btn">✕ Clear All</button>
+</div>
+
+<div id="body">
+  <div id="wrap">
+    <table id="tbl"></table>
+  </div>
+
+  <div id="cpanel">
+    <div id="cpanel-hdr">
+      <span class="ht">Time</span>
+      <span class="hc">💬</span>
+      <span class="hp">📞</span>
+    </div>
+    <div id="cpanel-rows">
+      <table id="ctbl"></table>
+    </div>
+  </div>
+</div>
+
+<div id="loading" style="padding:20px;color:#94a3b8">⏳ Loading schedule editor...</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────
+let A    = null;
+let drag = null;
+
+// ── Streamlit protocol ─────────────────────────────────────────────
+function post(msg) {
+  window.parent.postMessage(Object.assign({ isStreamlitMessage: true }, msg), '*');
+}
+function setHeight(h) { post({ type: 'streamlit:setFrameHeight', height: h }); }
+function setVal(v)    { post({ type: 'streamlit:setComponentValue', value: v, dataType: 'json' }); }
+
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'streamlit:render') {
+    A = e.data.args;
+    document.getElementById('loading').style.display = 'none';
+    buildTable(A);
+    buildCountPanel(A);
+    updateCounts();
+    sizeWrap();
+  }
+});
+
+function sendReady() { post({ type: 'streamlit:componentReady', apiVersion: 1 }); }
+sendReady();
+[150, 400, 900, 2000].forEach(t => setTimeout(sendReady, t));
+
+// ── Layout ─────────────────────────────────────────────────────────
+function sizeWrap() {
+  setTimeout(() => setHeight(document.body.scrollHeight + 4), 50);
+}
+window.addEventListener('resize', sizeWrap);
+
+// ── Color helpers ──────────────────────────────────────────────────
+function cbg(v) { return A && A.color_map[v] ? A.color_map[v].bg : '#F8FAFC'; }
+function cfg(v) { return A && A.color_map[v] ? A.color_map[v].fg : '#CBD5E1'; }
+
+// ── Build schedule table ───────────────────────────────────────────
+function buildTable(a) {
+  const { schedule_data, agents, time_slots, activities } = a;
+  const tbl = document.getElementById('tbl');
+  let h = '<thead><tr><th class="th-time">Time</th>';
+  agents.forEach(ag => { h += `<th title="${ag}">${ag.split(' ')[0]}</th>`; });
+  h += '</tr></thead><tbody>';
+
+  time_slots.forEach((slot, ri) => {
+    const isHour = slot.includes(':00');            // bold line at each on-the-hour slot
+    h += `<tr${isHour ? ' class="hr"' : ''}>`;
+    h += `<td class="tc">${slot}</td>`;
+    agents.forEach((_, ci) => {
+      const val = (schedule_data[ri] && schedule_data[ri][ci] != null)
+                  ? schedule_data[ri][ci] : '.';
+      h += `<td class="dc" data-r="${ri}" data-c="${ci}" style="background:${cbg(val)}">`;
+      h += `<select data-r="${ri}" data-c="${ci}" style="color:${cfg(val)}">`;
+      activities.forEach(act => {
+        h += `<option value="${act}"${act===val?' selected':''}>${act==='.'?'—':act}</option>`;
+      });
+      h += `</select><div class="fh" data-r="${ri}" data-c="${ci}"></div></td>`;
+    });
+    h += '</tr>';
+  });
+  h += '</tbody>';
+  tbl.innerHTML = h;
+
+  // Dropdown change
+  tbl.addEventListener('change', function(e) {
+    if (e.target.tagName !== 'SELECT') return;
+    const v = e.target.value;
+    const td = e.target.parentElement;
+    td.style.background = cbg(v);
+    e.target.style.color = cfg(v);
+    td.classList.add('changed');
+    markDirty();
+    updateCounts();
+  });
+
+  // Fill handle drag
+  tbl.addEventListener('mousedown', function(e) {
+    if (!e.target.classList.contains('fh')) return;
+    e.preventDefault();
+    const r = +e.target.dataset.r, c = +e.target.dataset.c;
+    const sel = getSelect(r, c);
+    const v = sel ? sel.value : '.';
+    drag = { r0: r, c0: c, r1: r, c1: c, v, bg: cbg(v), fg: cfg(v), dir: null };
+    document.body.classList.add('dragging');
+    document.addEventListener('mouseover', onOver);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+// ── Build count panel (time + chat + phones columns) ───────────────
+function buildCountPanel(a) {
+  const ctbl = document.getElementById('ctbl');
+  let h = '<colgroup>'
+        + '<col class="c-time"><col class="c-chat"><col class="c-phone">'
+        + '</colgroup><tbody>';
+  a.time_slots.forEach((slot, ri) => {
+    const isHour = slot.includes(':00');
+    h += `<tr${isHour ? ' class="hr"' : ''}>`;
+    h += `<td class="ct" id="ct-${ri}">${slot}</td>`;
+    h += `<td class="cc" id="cc-${ri}">—</td>`;
+    h += `<td class="cp" id="cp-${ri}">—</td>`;
+    h += '</tr>';
+  });
+  h += '</tbody>';
+  ctbl.innerHTML = h;
+}
+
+// ── Drag handlers ──────────────────────────────────────────────────
+function onOver(e) {
+  if (!drag) return;
+  const td = e.target.closest ? e.target.closest('td.dc') : null;
+  if (!td) return;
+  const r = +td.dataset.r, c = +td.dataset.c;
+
+  if (drag.dir === null) {
+    if (r !== drag.r0) drag.dir = 'col';
+    else if (c !== drag.c0) drag.dir = 'row';
+    else return;
+  }
+
+  clearFP();
+
+  if (drag.dir === 'col') {
+    drag.r1 = r;
+    const mn = Math.min(drag.r0, r), mx = Math.max(drag.r0, r);
+    for (let i = mn; i <= mx; i++) getTD(i, drag.c0)?.classList.add('fp');
+  } else {
+    drag.c1 = c;
+    const mn = Math.min(drag.c0, c), mx = Math.max(drag.c0, c);
+    for (let i = mn; i <= mx; i++) getTD(drag.r0, i)?.classList.add('fp');
+  }
+}
+
+function onUp() {
+  document.removeEventListener('mouseover', onOver);
+  document.removeEventListener('mouseup', onUp);
+  document.body.classList.remove('dragging');
+  if (!drag) return;
+
+  if (drag.dir === 'col') {
+    const mn = Math.min(drag.r0, drag.r1), mx = Math.max(drag.r0, drag.r1);
+    for (let i = mn; i <= mx; i++) applyCell(i, drag.c0);
+  } else if (drag.dir === 'row') {
+    const mn = Math.min(drag.c0, drag.c1), mx = Math.max(drag.c0, drag.c1);
+    for (let i = mn; i <= mx; i++) applyCell(drag.r0, i);
+  }
+
+  clearFP();
+  drag = null;
+  markDirty();
+  updateCounts();
+}
+
+function applyCell(r, c) {
+  const td  = getTD(r, c); if (!td) return;
+  const sel = td.querySelector('select'); if (!sel) return;
+  sel.value = drag.v;
+  td.style.background = drag.bg;
+  sel.style.color = drag.fg;
+  td.classList.add('changed');
+  td.classList.remove('fp');
+}
+
+// ── Helpers ────────────────────────────────────────────────────────
+function getTD(r, c) {
+  return document.querySelector(`td.dc[data-r="${r}"][data-c="${c}"]`);
+}
+function getSelect(r, c) {
+  const td = getTD(r, c); return td ? td.querySelector('select') : null;
+}
+function clearFP() {
+  document.querySelectorAll('td.dc.fp').forEach(td => td.classList.remove('fp'));
+}
+
+// ── Live counts (per-row panel) ────────────────────────────────────
+function updateCounts() {
+  if (!A) return;
+  const CS = new Set(A.live_chat_acts), PS = new Set(A.live_phone_acts);
+
+  A.time_slots.forEach((_, ri) => {
+    let rc = 0, rp = 0;
+    A.agents.forEach((_, ci) => {
+      const s = getSelect(ri, ci); if (!s) return;
+      if (CS.has(s.value)) rc++;
+      if (PS.has(s.value)) rp++;
+    });
+
+    const cc = document.getElementById(`cc-${ri}`);
+    const cp = document.getElementById(`cp-${ri}`);
+    if (cc) { cc.textContent = rc > 0 ? rc : '—'; cc.classList.toggle('hi', rc >= 3); }
+    if (cp) { cp.textContent = rp > 0 ? rp : '—'; cp.classList.toggle('hi', rp >= 3); }
+  });
+}
+
+// ── Status ─────────────────────────────────────────────────────────
+function markDirty() {
+  const s = document.getElementById('status');
+  s.textContent = 'Unsaved changes'; s.className = 'dirty';
+}
+
+// ── Clear All (two-click, no confirm() dialog) ─────────────────────
+let _clearArmed = false, _clearTimer = null;
+document.getElementById('clear-btn').addEventListener('click', function() {
+  if (!A) return;
+  if (!_clearArmed) {
+    _clearArmed = true;
+    this.textContent = '⚠ Confirm?';
+    this.style.background = '#dc2626';
+    this.style.color = '#fff';
+    this.style.borderColor = '#dc2626';
+    const btn = this;
+    _clearTimer = setTimeout(function() {
+      _clearArmed = false;
+      btn.textContent = '✕ Clear All';
+      btn.style.background = '';
+      btn.style.color = '#dc2626';
+      btn.style.borderColor = '#fca5a5';
+    }, 3000);
+    return;
+  }
+  _clearArmed = false;
+  if (_clearTimer) { clearTimeout(_clearTimer); _clearTimer = null; }
+  this.textContent = '✕ Clear All';
+  this.style.background = '';
+  this.style.color = '#dc2626';
+  this.style.borderColor = '#fca5a5';
+  A.time_slots.forEach((_, ri) => {
+    A.agents.forEach((_, ci) => {
+      const td = getTD(ri, ci); if (!td) return;
+      const sel = td.querySelector('select'); if (!sel) return;
+      sel.value = '.';
+      td.style.background = cbg('.');
+      sel.style.color = cfg('.');
+      td.classList.add('changed');
+    });
+  });
+  markDirty();
+  updateCounts();
+});
+
+// ── Save ───────────────────────────────────────────────────────────
+document.getElementById('save-btn').addEventListener('click', function() {
+  if (!A) return;
+  const data = A.time_slots.map((_, ri) =>
+    A.agents.map((_, ci) => { const s = getSelect(ri, ci); return s ? s.value : '.'; })
+  );
+  setVal({ data, saved: true });
+  const s = document.getElementById('status');
+  s.textContent = 'Saved ✓'; s.className = 'saved';
+  document.querySelectorAll('td.dc.changed').forEach(td => td.classList.remove('changed'));
+});
+</script>
+</body>
+</html>

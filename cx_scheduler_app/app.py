@@ -5,10 +5,38 @@ import pandas as pd
 import datetime
 import hashlib
 import secrets
+import math
 from pathlib import Path
+import threading as _threading
+import http.server as _http_server
+import socket as _socket
+
+@st.cache_resource
+def _launch_editor_server():
+    """Serve cx_component/ from a background HTTP server so declare_component url= works."""
+    comp_dir = str(Path(__file__).parent / "cx_component")
+    port = 3011
+    for p in range(3011, 3099):
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                s.bind(("localhost", p))
+            port = p
+            break
+        except OSError:
+            continue
+
+    class _H(_http_server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=comp_dir, **kw)
+        def log_message(self, *a):
+            pass
+
+    srv = _http_server.HTTPServer(("localhost", port), _H)
+    _threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return port
 
 st.set_page_config(
-    page_title="CX Scheduler",
+    page_title="CX Schedule",
     page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -25,7 +53,17 @@ ACTIVITY_TYPES = [
     "Bereavement", "FMLA", "Training", "Holiday", "PTO", "VTO", "Sick",
 ]
 
-TIMEOFF_TYPES = ["PTO", "Sick", "Personal", "Holiday", "Bereavement", "Vacation", "FMLA", "VTO"]
+TIMEOFF_TYPES = ["VTO", "Shift Swap", "Sick Leave (Please submit in Kronos)", "Paid Time Off (Please submit in Kronos)", "Jury Duty", "Bereavement"]
+
+# Maps time-off request type → schedule cell activity label
+TIMEOFF_TO_ACTIVITY = {
+    "Paid Time Off (Please submit in Kronos)": "PTO",
+    "Sick Leave (Please submit in Kronos)":    "Sick",
+    "VTO":          "VTO",
+    "Bereavement":  "Bereavement",
+    "Jury Duty":    "Jury Duty",
+    "Shift Swap":   None,  # handled separately via swap logic
+}
 
 # (bg_hex, text_hex)
 ACT_COLORS = {
@@ -70,6 +108,44 @@ def _make_time_slots():
 
 TIME_SLOTS = _make_time_slots()
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+def _default_to_today_tab(week_start):
+    """
+    When viewing the current week, inject a one-shot JS snippet that clicks
+    today's day tab.  sessionStorage prevents re-clicking on Streamlit reruns.
+    """
+    today = datetime.date.today()
+    current_monday = str(today - datetime.timedelta(days=today.weekday()))
+    if week_start != current_monday:
+        return
+    label = DAYS[today.weekday()][:3]   # "Mon", "Tue", …
+    ss_key = f"sched_day_tab__{week_start}"
+    st_components.html(
+        f"""<script>
+(function(){{
+  var KEY   = "{ss_key}";
+  var LABEL = "{label}";
+  if (window.parent.sessionStorage.getItem(KEY)) return;
+  function tryClick() {{
+    var tabs = window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+    for (var i = 0; i < tabs.length; i++) {{
+      if (tabs[i].textContent.trim().startsWith(LABEL)) {{
+        tabs[i].click();
+        window.parent.sessionStorage.setItem(KEY, "1");
+        return true;
+      }}
+    }}
+    return false;
+  }}
+  var n = 0;
+  var iv = setInterval(function() {{
+    if (tryClick() || ++n > 40) clearInterval(iv);
+  }}, 75);
+}})();
+</script>""",
+        height=0,
+    )
+
 
 def _fmt_slot(slot_str):
     """'9:00 AM' → '9a',  '9:30 AM' → '930a',  '12:00 PM' → '12p'"""
@@ -164,6 +240,37 @@ def init_db():
             UNIQUE(template_id, day_index, time_slot, agent_name),
             FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            read INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS agent_work_hours (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_name TEXT NOT NULL,
+            day_index INTEGER NOT NULL,
+            start_slot TEXT NOT NULL DEFAULT '9:00 AM',
+            end_slot TEXT NOT NULL DEFAULT '5:00 PM',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(agent_name, day_index)
+        );
+        CREATE TABLE IF NOT EXISTS agent_coverage_rules (
+            agent_name TEXT PRIMARY KEY,
+            allowed_channels TEXT NOT NULL DEFAULT 'both',
+            lunch_slot TEXT DEFAULT NULL,
+            lunch_duration INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS coverage_global_rules (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT '0'
+        );
+        INSERT OR IGNORE INTO coverage_global_rules (key, value) VALUES ('no_back_to_back', '1');
     """)
     conn.commit()
 
@@ -212,8 +319,51 @@ def init_db():
             c.execute("ALTER TABLE time_off_requests ADD COLUMN team_name TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
+    if "start_time" not in _col_names("time_off_requests"):
+        c.execute("ALTER TABLE time_off_requests ADD COLUMN start_time TEXT DEFAULT ''")
+        conn.commit()
+    if "end_time" not in _col_names("time_off_requests"):
+        c.execute("ALTER TABLE time_off_requests ADD COLUMN end_time TEXT DEFAULT ''")
+        conn.commit()
+    if "swap_from_date" not in _col_names("time_off_requests"):
+        c.execute("ALTER TABLE time_off_requests ADD COLUMN swap_from_date TEXT DEFAULT ''")
+        conn.commit()
+    if "swap_from_start" not in _col_names("time_off_requests"):
+        c.execute("ALTER TABLE time_off_requests ADD COLUMN swap_from_start TEXT DEFAULT ''")
+        conn.commit()
+    if "swap_from_end" not in _col_names("time_off_requests"):
+        c.execute("ALTER TABLE time_off_requests ADD COLUMN swap_from_end TEXT DEFAULT ''")
+        conn.commit()
+
+    if "team_order" not in _col_names("users"):
+        c.execute("ALTER TABLE users ADD COLUMN team_order TEXT DEFAULT ''")
+        conn.commit()
+
     if "notes" not in _col_names("agents"):
         c.execute("ALTER TABLE agents ADD COLUMN notes TEXT DEFAULT ''")
+        conn.commit()
+
+    if "default_activity" not in _col_names("teams"):
+        c.execute("ALTER TABLE teams ADD COLUMN default_activity TEXT DEFAULT ''")
+        conn.commit()
+
+    if "default_activity" not in _col_names("agents"):
+        c.execute("ALTER TABLE agents ADD COLUMN default_activity TEXT DEFAULT ''")
+        conn.commit()
+
+    if "linked_user_id" not in _col_names("agents"):
+        c.execute("ALTER TABLE agents ADD COLUMN linked_user_id INTEGER DEFAULT NULL")
+        conn.commit()
+    if "slack_user_id" not in _col_names("agents"):
+        c.execute("ALTER TABLE agents ADD COLUMN slack_user_id TEXT DEFAULT NULL")
+        conn.commit()
+
+    if "split_start_slot" not in _col_names("agent_work_hours"):
+        c.execute("ALTER TABLE agent_work_hours ADD COLUMN split_start_slot TEXT DEFAULT NULL")
+        conn.commit()
+
+    if "split_end_slot" not in _col_names("agent_work_hours"):
+        c.execute("ALTER TABLE agent_work_hours ADD COLUMN split_end_slot TEXT DEFAULT NULL")
         conn.commit()
 
     if c.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
@@ -315,6 +465,12 @@ def get_user_by_username(username):
     conn.close()
     return dict(row) if row else None
 
+def get_user_by_id(user_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
 def list_users():
     conn = get_conn()
     rows = conn.execute("SELECT * FROM users ORDER BY role, username").fetchall()
@@ -350,6 +506,55 @@ def reset_password(user_id, new_password):
     conn.commit()
     conn.close()
 
+def get_user_team_order(user_id):
+    """Return saved team order list for a user, or [] if not set."""
+    conn = get_conn()
+    row = conn.execute("SELECT team_order FROM users WHERE id=?", (user_id,)).fetchone()
+    conn.close()
+    raw = row["team_order"] if row and row["team_order"] else ""
+    return [t for t in raw.split(",") if t] if raw else []
+
+def save_user_team_order(user_id, order_list):
+    """Persist the team display order for a user."""
+    conn = get_conn()
+    conn.execute("UPDATE users SET team_order=? WHERE id=?", (",".join(order_list), user_id))
+    conn.commit()
+    conn.close()
+
+def resolve_team_order(user, teams_with_agents):
+    """
+    Return an ordered list of team dicts for the given user.
+    Priority: 1) saved DB order  2) user's own team first  3) DB insertion order.
+    Syncs session_state and DB so reorders persist.
+    """
+    uid  = user["id"] if user else 0
+    uname = user.get("display_name", "") if user else ""
+    key  = f"team_order_{uid}"
+    all_names = [t["name"] for t in teams_with_agents]
+
+    if key not in st.session_state:
+        saved = get_user_team_order(uid)
+        # Sync: keep only teams that still exist, append new ones
+        saved = [n for n in saved if n in all_names]
+        new   = [n for n in all_names if n not in saved]
+        order = saved + new
+        # If no saved order, put user's own team first
+        if not saved:
+            agents = get_agents()
+            my_team = next((a["team_name"] for a in agents if a["name"] == uname), None)
+            if my_team and my_team in order:
+                order = [my_team] + [n for n in order if n != my_team]
+        st.session_state[key] = order
+    else:
+        # Sync new/removed teams into existing session order
+        cur = set(all_names)
+        saved = [n for n in st.session_state[key] if n in cur]
+        new   = [n for n in all_names if n not in set(saved)]
+        st.session_state[key] = saved + new
+
+    lookup = {t["name"]: t for t in teams_with_agents}
+    return [lookup[n] for n in st.session_state[key] if n in lookup], key
+
 def delete_user_db(user_id):
     conn = get_conn()
     conn.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -359,36 +564,40 @@ def delete_user_db(user_id):
 def show_login():
     st.markdown("""
     <style>
-    .login-wrap{max-width:380px;margin:80px auto 0;background:white;
-                border-radius:4px;padding:40px 36px;border:1px solid #D8D8D8;
-                box-shadow:0 2px 16px rgba(29,32,25,0.06)}
-    .login-logo{font-family:'Cheltenham',Georgia,serif;font-size:24px;font-weight:bold;
+    .login-wrap{background:white;border-radius:8px;padding:40px 36px;
+                border:1px solid #D8D8D8;box-shadow:0 4px 24px rgba(29,32,25,0.08);
+                margin-top:60px}
+    .login-logo{font-family:'Cheltenham',Georgia,serif;font-size:26px;font-weight:bold;
                 color:#1D2019;margin-bottom:4px;letter-spacing:-0.01em}
     .login-brand{font-family:'DM Sans',Helvetica,sans-serif;font-size:10px;
                  color:#89AC9E;letter-spacing:0.15em;text-transform:uppercase;margin-bottom:28px}
-    </style>
-    <div class="login-wrap">
-        <div class="login-logo">CX Scheduler</div>
-        <div class="login-brand">Framebridge</div>
-    </div>""", unsafe_allow_html=True)
+    </style>""", unsafe_allow_html=True)
 
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    _, mid, _ = st.columns([1.5, 1, 1.5])
+    with mid:
+        st.markdown("""
+        <div class="login-wrap">
+            <div class="login-logo">CX Schedule</div>
+            <div class="login-brand">Framebridge</div>
+        </div>""", unsafe_allow_html=True)
 
-    if submitted:
-        user = get_user_by_username(username)
-        if user and user["active"] and _verify_pw(password, user["password_hash"]):
-            st.session_state["cx_user"] = {
-                "id": user["id"],
-                "username": user["username"],
-                "display_name": user["display_name"] or user["username"],
-                "role": user["role"],
-            }
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
+        with st.form("login_form"):
+            username  = st.text_input("Username")
+            password  = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+
+        if submitted:
+            user = get_user_by_username(username)
+            if user and user["active"] and _verify_pw(password, user["password_hash"]):
+                st.session_state["cx_user"] = {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "display_name": user["display_name"] or user["username"],
+                    "role": user["role"],
+                }
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
 
     st.stop()
 
@@ -527,12 +736,21 @@ def get_schedule_df(week_start, day_index, agent_names):
     df.index.name = "Time"
     return df
 
-def save_schedule_df(week_start, day_index, df):
+def save_schedule_df(week_start, day_index, df, notify=True):
     conn = get_conn()
     c = conn.cursor()
+    changed_agents = set()
     for slot in df.index:
         for agent in df.columns:
             act = str(df.at[slot, agent])
+            # Check existing value to detect changes
+            if notify:
+                existing = c.execute(
+                    "SELECT activity FROM schedule_cells WHERE week_start=? AND day_index=? AND time_slot=? AND agent_name=?",
+                    (week_start, day_index, slot, agent)
+                ).fetchone()
+                if existing and existing["activity"] != act and act != ".":
+                    changed_agents.add(agent)
             c.execute("""
                 INSERT INTO schedule_cells (week_start,day_index,time_slot,agent_name,activity)
                 VALUES (?,?,?,?,?)
@@ -541,6 +759,33 @@ def save_schedule_df(week_start, day_index, df):
             """, (week_start, day_index, slot, agent, act))
     conn.commit()
     conn.close()
+    # Create notifications for agents whose schedule changed
+    if notify:
+        day_name = DAYS[day_index] if day_index < len(DAYS) else f"Day {day_index}"
+        for agent in changed_agents:
+            add_notification(agent,
+                f"📅 Your {day_name} schedule (week of {week_start}) has been updated.")
+
+        # Slack DM — only for today's schedule, only if DM notifications are enabled
+        _today = datetime.date.today()
+        _today_ws = str(_today - datetime.timedelta(days=_today.weekday()))
+        if (week_start == _today_ws and day_index == _today.weekday()
+                and get_setting("slack_dm_schedule_updates", "") == "yes"
+                and changed_agents):
+            _conn_dm = get_conn()
+            for agent in changed_agents:
+                _row = _conn_dm.execute(
+                    "SELECT slack_user_id FROM agents WHERE name=?", (agent,)
+                ).fetchone()
+                _slack_id = _row["slack_user_id"] if _row else None
+                if _slack_id:
+                    _first = agent.split()[0]
+                    send_slack_dm(
+                        _slack_id,
+                        f"📅 Hi {_first}! Your schedule for today ({_today.strftime('%-m/%-d')}) "
+                        f"has been updated. Check the CX Schedule app for your current assignments."
+                    )
+            _conn_dm.close()
 
 def copy_week(src, tgt):
     conn = get_conn()
@@ -565,9 +810,18 @@ def apply_approved_timeoff(week_start):
     for req in approved:
         s = datetime.date.fromisoformat(req["start_date"])
         e = datetime.date.fromisoformat(req["end_date"])
+        st_time = req["start_time"] if req["start_time"] else ""
+        en_time = req["end_time"]   if req["end_time"]   else ""
+        # Determine which slots to fill: full day or bounded by start_time/end_time
+        if st_time and en_time and st_time in TIME_SLOTS and en_time in TIME_SLOTS:
+            si = TIME_SLOTS.index(st_time)
+            ei = TIME_SLOTS.index(en_time)
+            slots_to_fill = TIME_SLOTS[si:ei + 1]
+        else:
+            slots_to_fill = TIME_SLOTS
         for di, dd in enumerate([week_date + datetime.timedelta(days=i) for i in range(7)]):
             if s <= dd <= e:
-                for slot in TIME_SLOTS:
+                for slot in slots_to_fill:
                     c.execute("""
                         INSERT INTO schedule_cells (week_start,day_index,time_slot,agent_name,activity)
                         VALUES (?,?,?,?,?)
@@ -730,31 +984,423 @@ def update_request_status(req_id, status, approved_by=""):
     conn = get_conn()
     conn.execute("UPDATE time_off_requests SET status=?,approved_by=? WHERE id=?", (status, approved_by, req_id))
     conn.commit()
+    if status == "Approved":
+        row = conn.execute("SELECT * FROM time_off_requests WHERE id=?", (req_id,)).fetchone()
+        req = dict(row) if row else None
+    else:
+        req = None
+    conn.close()
+    if req:
+        apply_single_timeoff(req)
+
+def apply_single_timeoff(req):
+    """Write a single approved time-off request into schedule_cells immediately."""
+    rtype = req.get("type", "")
+    agent = req.get("agent_name", "")
+    if not agent:
+        return
+
+    def _write_slots(date_obj, slots, activity):
+        week_start = str(date_obj - datetime.timedelta(days=date_obj.weekday()))
+        di = date_obj.weekday()
+        conn = get_conn()
+        for slot in slots:
+            conn.execute("""
+                INSERT INTO schedule_cells (week_start,day_index,time_slot,agent_name,activity)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(week_start,day_index,time_slot,agent_name)
+                DO UPDATE SET activity=excluded.activity
+            """, (week_start, di, slot, agent, activity))
+        conn.commit()
+        conn.close()
+
+    def _slots_between(start_t, end_t):
+        if start_t in TIME_SLOTS and end_t in TIME_SLOTS:
+            si, ei = TIME_SLOTS.index(start_t), TIME_SLOTS.index(end_t)
+            return TIME_SLOTS[si:ei + 1]
+        return TIME_SLOTS
+
+    if rtype == "Shift Swap":
+        # Clear the "giving up" block
+        from_date_str = req.get("swap_from_date", "")
+        from_start    = req.get("swap_from_start", "")
+        from_end      = req.get("swap_from_end", "")
+        if from_date_str and from_start and from_end:
+            from_date = datetime.date.fromisoformat(from_date_str)
+            _write_slots(from_date, _slots_between(from_start, from_end), ".")
+
+        # Fill the "taking on" block with agent's default activity
+        to_date_str = req.get("start_date", "")
+        to_start    = req.get("start_time", "")
+        to_end      = req.get("end_time", "")
+        if to_date_str and to_start and to_end:
+            ag_data = next((a for a in get_agents() if a["name"] == agent), {})
+            skill = ag_data.get("default_activity", "") or ag_data.get("team_name", "Support")
+            to_date = datetime.date.fromisoformat(to_date_str)
+            _write_slots(to_date, _slots_between(to_start, to_end), skill)
+    else:
+        activity = TIMEOFF_TO_ACTIVITY.get(rtype, rtype)
+        start_t = req.get("start_time", "")
+        end_t   = req.get("end_time", "")
+        slots   = _slots_between(start_t, end_t) if (start_t and end_t) else TIME_SLOTS
+        s = datetime.date.fromisoformat(req["start_date"])
+        e = datetime.date.fromisoformat(req["end_date"])
+        d = s
+        while d <= e:
+            _write_slots(d, slots, activity)
+            d += datetime.timedelta(days=1)
+
+# ─── APP SETTINGS ─────────────────────────────────────────────────────────────
+
+def get_setting(key, default=""):
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+def set_setting(key, value):
+    conn = get_conn()
+    conn.execute("INSERT INTO app_settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, value))
+    conn.commit()
     conn.close()
 
-def add_time_off_request(agent, team, start, end, rtype, notes=""):
+# ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
+
+def add_notification(agent_name, message):
+    conn = get_conn()
+    conn.execute("INSERT INTO notifications (agent_name,message,created_at) VALUES (?,?,?)",
+                 (agent_name, message, str(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))))
+    conn.commit()
+    conn.close()
+
+def get_notifications(agent_name, unread_only=False):
+    conn = get_conn()
+    if unread_only:
+        rows = conn.execute("SELECT * FROM notifications WHERE agent_name=? AND read=0 ORDER BY id DESC", (agent_name,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM notifications WHERE agent_name=? ORDER BY id DESC LIMIT 20", (agent_name,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def mark_notifications_read(agent_name):
+    conn = get_conn()
+    conn.execute("UPDATE notifications SET read=1 WHERE agent_name=?", (agent_name,))
+    conn.commit()
+    conn.close()
+
+# ─── SLACK WEBHOOK ────────────────────────────────────────────────────────────
+
+# ─── WORK HOURS & BASE SCHEDULE ───────────────────────────────────────────────
+
+def get_agent_work_hours(agent_name):
+    """Returns {day_index: {start_slot, end_slot, is_active, split_start_slot, split_end_slot}} for all 7 days."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT day_index, start_slot, end_slot, is_active, split_start_slot, split_end_slot FROM agent_work_hours WHERE agent_name=?",
+        (agent_name,)
+    ).fetchall()
+    conn.close()
+    result = {}
+    for r in rows:
+        result[r["day_index"]] = {
+            "start_slot":       r["start_slot"],
+            "end_slot":         r["end_slot"],
+            "is_active":        bool(r["is_active"]),
+            "split_start_slot": r["split_start_slot"],
+            "split_end_slot":   r["split_end_slot"],
+        }
+    return result
+
+def save_agent_work_hours(agent_name, day_index, start_slot, end_slot, is_active,
+                          split_start_slot=None, split_end_slot=None):
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO agent_work_hours (agent_name, day_index, start_slot, end_slot, is_active,
+                                      split_start_slot, split_end_slot)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(agent_name, day_index)
+        DO UPDATE SET start_slot=excluded.start_slot,
+                      end_slot=excluded.end_slot,
+                      is_active=excluded.is_active,
+                      split_start_slot=excluded.split_start_slot,
+                      split_end_slot=excluded.split_end_slot
+    """, (agent_name, day_index, start_slot, end_slot, int(is_active),
+          split_start_slot, split_end_slot))
+    conn.commit()
+    conn.close()
+
+def get_team_default_activity(team_name):
+    conn = get_conn()
+    row = conn.execute("SELECT default_activity FROM teams WHERE name=?", (team_name,)).fetchone()
+    conn.close()
+    return row["default_activity"] if row else ""
+
+def set_team_default_activity(team_name, activity):
+    conn = get_conn()
+    conn.execute("UPDATE teams SET default_activity=? WHERE name=?", (activity, team_name))
+    conn.commit()
+    conn.close()
+
+def get_agent_default_activity(agent_name):
+    """Returns agent override if set, else falls back to team default."""
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT a.default_activity as agent_act, t.default_activity as team_act "
+        "FROM agents a LEFT JOIN teams t ON a.team_name=t.name WHERE a.name=?",
+        (agent_name,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return ""
+    return row["agent_act"] if row["agent_act"] else row["team_act"] or ""
+
+def apply_base_schedule(week_start, overwrite=False):
+    """
+    Fill schedule_cells for every agent based on their configured work hours
+    and default activity (agent override → team default).
+    Then overlay the agent's configured lunch slot with 'Break'.
+    If overwrite=False, only fills slots currently set to '.'.
+    Returns count of slots written.
+    """
+    agents = get_agents()
+    agent_rules, _ = get_coverage_rules()
+    count  = 0
+    for ag in agents:
+        wh      = get_agent_work_hours(ag["name"])
+        default = get_agent_default_activity(ag["name"])
+        if not default:
+            continue  # Skip agents with no default activity configured
+        lunch_rules   = agent_rules.get(ag["name"], {})
+        lunch_slot    = lunch_rules.get("lunch_slot") or None
+        lunch_dur     = int(lunch_rules.get("lunch_duration", 1))
+        # Build set of lunch slots for this agent
+        if lunch_slot and lunch_slot in TIME_SLOTS:
+            li = TIME_SLOTS.index(lunch_slot)
+            lunch_slots = set(TIME_SLOTS[li:li + lunch_dur])
+        else:
+            lunch_slots = set()
+        for di in range(len(DAYS)):
+            day_cfg = wh.get(di)
+            if not day_cfg or not day_cfg["is_active"]:
+                continue
+            start = day_cfg["start_slot"]
+            end   = day_cfg["end_slot"]
+            if start not in TIME_SLOTS or end not in TIME_SLOTS:
+                continue
+            si = TIME_SLOTS.index(start)
+            ei = TIME_SLOTS.index(end)
+            if ei <= si:
+                continue
+            # Build list of slot ranges to fill (primary + optional split segment)
+            _ranges = [TIME_SLOTS[si:ei]]
+            _sp_start = day_cfg.get("split_start_slot")
+            _sp_end   = day_cfg.get("split_end_slot")
+            if _sp_start and _sp_end and _sp_start in TIME_SLOTS and _sp_end in TIME_SLOTS:
+                _spi = TIME_SLOTS.index(_sp_start)
+                _spei = TIME_SLOTS.index(_sp_end)
+                if _spei > _spi:
+                    _ranges.append(TIME_SLOTS[_spi:_spei])
+            conn = get_conn()
+            for _slot_range in _ranges:
+                for slot in _slot_range:
+                    activity = "Break" if slot in lunch_slots else default
+                    if not overwrite:
+                        existing = conn.execute(
+                            "SELECT activity FROM schedule_cells WHERE week_start=? AND day_index=? AND time_slot=? AND agent_name=?",
+                            (week_start, di, slot, ag["name"])
+                        ).fetchone()
+                        if existing and existing["activity"] != ".":
+                            continue
+                    conn.execute("""
+                        INSERT INTO schedule_cells (week_start, day_index, time_slot, agent_name, activity)
+                        VALUES (?,?,?,?,?)
+                        ON CONFLICT(week_start,day_index,time_slot,agent_name)
+                        DO UPDATE SET activity=excluded.activity
+                    """, (week_start, di, slot, ag["name"], activity))
+                    count += 1
+            conn.commit()
+            conn.close()
+    return count
+
+
+def send_slack_message(text):
+    """Send a message to the configured Slack webhook. Silently fails if not configured."""
+    import urllib.request, json as _json
+    webhook = get_setting("slack_webhook_url", "")
+    if not webhook.startswith("https://hooks.slack.com/"):
+        return
+    try:
+        payload = _json.dumps({"text": text}).encode("utf-8")
+        req = urllib.request.Request(webhook, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass  # Never crash the app over a Slack failure
+
+def send_slack_dm(slack_user_id, text):
+    """Send a Slack DM to a specific user via Bot Token. Silently fails if not configured."""
+    import urllib.request, json as _json
+    token = get_setting("slack_bot_token", "")
+    if not token or not slack_user_id:
+        return
+    try:
+        _headers = {"Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}"}
+        # Open DM channel
+        req1 = urllib.request.Request(
+            "https://slack.com/api/conversations.open",
+            data=_json.dumps({"users": slack_user_id}).encode(),
+            headers=_headers,
+        )
+        resp1 = _json.loads(urllib.request.urlopen(req1, timeout=5).read())
+        if not resp1.get("ok"):
+            return
+        channel_id = resp1["channel"]["id"]
+        # Send message
+        req2 = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=_json.dumps({"channel": channel_id, "text": text}).encode(),
+            headers=_headers,
+        )
+        urllib.request.urlopen(req2, timeout=5)
+    except Exception:
+        pass
+
+def import_timeoff_from_sheet(csv_url):
+    """
+    Fetch a public Google Sheet (CSV export URL) and import rows as time-off requests.
+    Expected columns (case-insensitive): Agent, Team, Type of Request, Date and Time, Summary
+    Returns (imported_count, skipped_count, error_message)
+    """
+    import urllib.request as _ur
+    import ssl, csv, io, re
+    try:
+        import certifi as _certifi
+        _ssl_ctx = ssl.create_default_context(cafile=_certifi.where())
+    except ImportError:
+        _ssl_ctx = ssl.create_default_context()
+
+    # Convert edit/share URL → CSV export URL if needed
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", csv_url)
+    gid_m = re.search(r"gid=(\d+)", csv_url)
+    if m and "export?format=csv" not in csv_url:
+        sheet_id = m.group(1)
+        gid = gid_m.group(1) if gid_m else "0"
+        csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+    try:
+        with _ur.urlopen(csv_url, timeout=10, context=_ssl_ctx) as resp:
+            raw = resp.read().decode("utf-8-sig")
+    except Exception as e:
+        return 0, 0, f"Could not fetch sheet: {e}"
+
+    reader = csv.DictReader(io.StringIO(raw))
+    # Normalise header names
+    def _norm(h): return h.strip().lower().replace(" ", "_").replace("/", "_")
+    rows = [{_norm(k): (v or "").strip() for k, v in row.items()} for row in reader]
+
+    def _parse_date(s):
+        """Try several date formats, return datetime.date or None."""
+        s = s.strip()
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y",
+                    "%m-%d-%Y", "%Y/%m/%d", "%d/%m/%Y"):
+            try: return datetime.datetime.strptime(s, fmt).date()
+            except ValueError: pass
+        # Try extracting first date-like substring
+        m = re.search(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", s)
+        if m:
+            for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y"):
+                try: return datetime.datetime.strptime(m.group(1), fmt).date()
+                except ValueError: pass
+        return None
+
+    conn = get_conn()
+    imported = skipped = 0
+    agents_lower = {a["name"].lower(): a for a in get_agents()}
+    teams_lower  = {t["name"].lower(): t for t in get_teams()}
+
+    for row in rows:
+        agent_raw = row.get("agent", "")
+        if not agent_raw:
+            skipped += 1; continue
+
+        # Fuzzy-match agent name
+        agent_match = agents_lower.get(agent_raw.lower())
+        agent_name  = agent_match["name"] if agent_match else agent_raw
+
+        team_raw   = row.get("team", "")
+        team_match = teams_lower.get(team_raw.lower())
+        team_name  = team_match["name"] if team_match else team_raw
+
+        rtype   = row.get("type_of_request", row.get("type", "PTO")).strip() or "PTO"
+        notes   = row.get("summary", row.get("notes", "")).strip()
+        date_str = row.get("date_and_time", row.get("date", "")).strip()
+
+        # Parse date range "MM/DD – MM/DD" or "MM/DD to MM/DD" or single date
+        range_m = re.search(r"(\d[\d/\-.]+)\s*(?:to|–|-{1,2}|thru)\s*(\d[\d/\-.]+)", date_str, re.I)
+        if range_m:
+            start = _parse_date(range_m.group(1))
+            end   = _parse_date(range_m.group(2))
+        else:
+            start = _parse_date(date_str)
+            end   = start
+
+        if not start or not end:
+            skipped += 1; continue
+        if end < start:
+            end = start
+
+        # Skip duplicates (same agent + same start date already exists)
+        exists = conn.execute(
+            "SELECT 1 FROM time_off_requests WHERE agent_name=? AND start_date=?",
+            (agent_name, str(start))
+        ).fetchone()
+        if exists:
+            skipped += 1; continue
+
+        conn.execute(
+            "INSERT INTO time_off_requests (submitted_date,agent_name,team_name,start_date,end_date,type,status,notes) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (str(datetime.date.today()), agent_name, team_name, str(start), str(end), rtype, "Pending", notes)
+        )
+        imported += 1
+
+    conn.commit()
+    conn.close()
+    return imported, skipped, None
+
+
+def add_time_off_request(agent, team, start, end, rtype, notes="", start_time="", end_time="",
+                         swap_from_date="", swap_from_start="", swap_from_end=""):
     conn = get_conn()
     conn.execute(
-        "INSERT INTO time_off_requests (submitted_date,agent_name,team_name,start_date,end_date,type,status,notes) VALUES (?,?,?,?,?,?,?,?)",
-        (str(datetime.date.today()), agent, team, str(start), str(end), rtype, "Pending", notes)
+        "INSERT INTO time_off_requests "
+        "(submitted_date,agent_name,team_name,start_date,end_date,type,status,notes,"
+        "start_time,end_time,swap_from_date,swap_from_start,swap_from_end) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (str(datetime.date.today()), agent, team, str(start), str(end), rtype, "Pending", notes,
+         start_time, end_time, swap_from_date, swap_from_start, swap_from_end)
     )
     conn.commit()
     conn.close()
 
 # ─── TIMELINE HTML ────────────────────────────────────────────────────────────
 
-def build_timeline_html(agents_info, schedule_data, act_colors=None):
+def build_timeline_html(agents_info, schedule_data, act_colors=None, slot_label_map=None):
     """
     Transposed grid layout: times down the left, agent names across the top.
     agents_info: list of {"name": str, "team_name": str, "color": str}
     schedule_data: {agent_name: {time_slot: activity}}
     act_colors: {name: (bg_hex, fg_hex)} — if None, falls back to module-level ACT_COLORS
+    slot_label_map: optional {original_slot: display_label} for timezone conversion
     Returns a scrollable HTML table.
     """
     _colors = act_colors if act_colors is not None else ACT_COLORS
-    _INACTIVE_LOCAL = {".", "Break", "Admin", "PTO", "VTO", "Sick",
-                       "Holiday", "Bereavement", "FMLA", "Training", "Meeting"}
-    _ON_QUEUE_LOCAL = {"Chat", "Phones"}
+    _INACTIVE_LOCAL    = {".", "Break", "Admin", "PTO", "VTO", "Sick",
+                          "Holiday", "Bereavement", "FMLA", "Training", "Meeting"}
+    _LIVE_CHAT_LOCAL   = {"Chat"}
+    _LIVE_PHONES_LOCAL = {"Phones"}
 
     TIME_COL_W  = 54   # px — left time-label column
     AGENT_COL_W = 96   # px — each agent column
@@ -794,13 +1440,14 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
     )
     summary_ths = (
         f'<th style="{sum_th_style};background:#1A3A6A;color:#BFDBFE">Active</th>'
-        f'<th style="{sum_th_style};background:#0C3047;color:#BAE6FD">Queue</th>'
+        f'<th style="{sum_th_style};background:#0C4A6E;color:#BAE6FD">Chat</th>'
+        f'<th style="{sum_th_style};background:#065F46;color:#A7F3D0">Phone</th>'
     )
 
     # ── Body: one <tr> per time slot ──────────────────────────────────────────
     rows_html = ""
     for slot in TIME_SLOTS:
-        label   = _fmt_slot(slot)
+        label   = slot_label_map.get(slot, _fmt_slot(slot)) if slot_label_map else _fmt_slot(slot)
         is_hour = slot.split(":")[1].startswith("00")
 
         # Time label cell (sticky left column)
@@ -821,15 +1468,18 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
 
         # One cell per agent
         active_count = 0
-        queue_count  = 0
+        chat_count   = 0
+        phone_count  = 0
         agent_tds    = ""
         for ag in agents_info:
             act = schedule_data.get(ag["name"], {}).get(slot, ".")
             c_bg, c_fg = _colors.get(act, ("#F8F8F6", "#AAAAAA"))
             if act not in _INACTIVE_LOCAL:
                 active_count += 1
-            if act in _ON_QUEUE_LOCAL:
-                queue_count += 1
+            if act in _LIVE_CHAT_LOCAL:
+                chat_count += 1
+            elif act in _LIVE_PHONES_LOCAL:
+                phone_count += 1
             lbl = "" if act == "." else act
             agent_tds += (
                 f'<td title="{ag["name"]}: {act}" style="'
@@ -844,9 +1494,11 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         # Summary cells
         n = max(len(agents_info), 1)
         a_op  = round(0.12 + 0.55 * min(active_count / n, 1.0), 3) if active_count else 0.06
-        q_op  = round(0.12 + 0.55 * min(queue_count  / n, 1.0), 3) if queue_count  else 0.06
+        c_op  = round(0.12 + 0.55 * min(chat_count   / n, 1.0), 3) if chat_count   else 0.06
+        p_op  = round(0.12 + 0.55 * min(phone_count  / n, 1.0), 3) if phone_count  else 0.06
         a_bg  = f"rgba(29,78,216,{a_op})"
-        q_bg  = f"rgba(3,105,161,{q_op})"
+        c_bg  = f"rgba(3,105,161,{c_op})"
+        p_bg  = f"rgba(6,95,70,{p_op})"
         sum_td_base = (
             f'font-size:9px;font-weight:700;font-family:{FONT};'
             f'text-align:center;vertical-align:middle;height:{ROW_H}px;'
@@ -856,8 +1508,10 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         summary_tds = (
             f'<td style="background:{a_bg};color:#1E3A8A;{sum_td_base}">'
             f'{active_count if active_count else ""}</td>'
-            f'<td style="background:{q_bg};color:#0C4A6E;{sum_td_base}">'
-            f'{queue_count if queue_count else ""}</td>'
+            f'<td style="background:{c_bg};color:#0C4A6E;{sum_td_base}">'
+            f'{chat_count if chat_count else ""}</td>'
+            f'<td style="background:{p_bg};color:#064E3B;{sum_td_base}">'
+            f'{phone_count if phone_count else ""}</td>'
         )
 
         rows_html += f"<tr>{time_td}{agent_tds}{summary_tds}</tr>\n"
@@ -882,8 +1536,8 @@ def build_timeline_html(agents_info, schedule_data, act_colors=None):
         font-family:{FONT};
     }}
     .tl-scroll {{
-        overflow:auto;
-        max-height:640px;
+        overflow-x:auto;
+        overflow-y:visible;
     }}
     .tl-table {{
         border-collapse:collapse;
@@ -918,9 +1572,11 @@ COVERAGE_ROWS = [
     ("GW",          "#92400E", "#FDE68A"),
     ("Retail",      "#991B1B", "#FECACA"),
 ]
-_ON_QUEUE  = {"Chat", "Phones"}
-_INACTIVE  = {".", "Break", "Admin", "PTO", "VTO", "Sick",
-              "Holiday", "Bereavement", "FMLA", "Training"}
+_LIVE_CHAT   = {"Chat"}
+_LIVE_PHONES = {"Phones"}
+_ON_QUEUE    = _LIVE_CHAT | _LIVE_PHONES   # kept for backward compat
+_INACTIVE    = {".", "Break", "Admin", "PTO", "VTO", "Sick",
+               "Holiday", "Bereavement", "FMLA", "Training"}
 
 def _hex_to_rgb(h):
     h = h.lstrip("#")
@@ -1015,32 +1671,60 @@ def build_coverage_bar_html(sched_data, act_colors=None):
             <div>{cells}</div>
         </div>"""
 
-    # ── On-queue total (Chat + Phones) ─────────────────────────────────────────
-    oq_cells = ""
-    max_oq = max(
-        (sum(count(s, a) for a in _ON_QUEUE) for s in TIME_SLOTS), default=0
+    # ── Live Chat total ────────────────────────────────────────────────────────
+    chat_cells = ""
+    max_chat = max(
+        (sum(count(s, a) for a in _LIVE_CHAT) for s in TIME_SLOTS), default=0
     ) or 1
     for slot in TIME_SLOTS:
-        oq = sum(count(slot, a) for a in _ON_QUEUE)
-        if oq == 0:
+        cv = sum(count(slot, a) for a in _LIVE_CHAT)
+        if cv == 0:
             cs = "background:#EFF6FF;color:#CBD5E1"; txt = ""
         else:
-            intensity = 0.3 + 0.7 * min(oq / max(max_oq, 1), 1.0)
+            intensity = 0.3 + 0.7 * min(cv / max(max_chat, 1), 1.0)
             cs = f"background:{_blend('#3B82F6', intensity)};color:#1E3A8A"
-            txt = str(oq)
-        oq_cells += (
-            f'<div title="On queue @ {slot}: {oq}" '
-            f'style="display:inline-block;width:{SLOT_W}px;height:26px;{cs};'
-            f'font-size:9px;font-weight:700;line-height:26px;text-align:center;'
+            txt = str(cv)
+        chat_cells += (
+            f'<div title="Live Chat @ {slot}: {cv}" '
+            f'style="display:inline-block;width:{SLOT_W}px;height:24px;{cs};'
+            f'font-size:9px;font-weight:700;line-height:24px;text-align:center;'
             f'box-sizing:border-box;border-right:1px solid rgba(0,0,0,0.22)">{txt}</div>'
         )
     rows_html += f"""
-    <div style="display:flex;align-items:stretch;height:26px;border-bottom:2px solid #BFDBFE">
+    <div style="display:flex;align-items:stretch;height:24px;border-bottom:1px solid #BFDBFE">
         <div style="width:{AGENT_COL_W}px;flex-shrink:0;display:flex;align-items:center;
                     padding:0 10px;border-right:1px solid #BFDBFE;background:#EFF6FF">
-            <span style="font-size:10px;font-weight:700;color:#1D4ED8">🎧 On queue</span>
+            <span style="font-size:10px;font-weight:700;color:#1D4ED8">💬 Live Chat</span>
         </div>
-        <div>{oq_cells}</div>
+        <div>{chat_cells}</div>
+    </div>"""
+
+    # ── Live Phones total ──────────────────────────────────────────────────────
+    phone_cells = ""
+    max_phone = max(
+        (sum(count(s, a) for a in _LIVE_PHONES) for s in TIME_SLOTS), default=0
+    ) or 1
+    for slot in TIME_SLOTS:
+        pv = sum(count(slot, a) for a in _LIVE_PHONES)
+        if pv == 0:
+            cs = "background:#F0FDF9;color:#CBD5E1"; txt = ""
+        else:
+            intensity = 0.3 + 0.7 * min(pv / max(max_phone, 1), 1.0)
+            cs = f"background:{_blend('#10B981', intensity)};color:#065F46"
+            txt = str(pv)
+        phone_cells += (
+            f'<div title="Live Phones @ {slot}: {pv}" '
+            f'style="display:inline-block;width:{SLOT_W}px;height:24px;{cs};'
+            f'font-size:9px;font-weight:700;line-height:24px;text-align:center;'
+            f'box-sizing:border-box;border-right:1px solid rgba(0,0,0,0.22)">{txt}</div>'
+        )
+    rows_html += f"""
+    <div style="display:flex;align-items:stretch;height:24px;border-bottom:2px solid #A7F3D0">
+        <div style="width:{AGENT_COL_W}px;flex-shrink:0;display:flex;align-items:center;
+                    padding:0 10px;border-right:1px solid #A7F3D0;background:#F0FDF9">
+            <span style="font-size:10px;font-weight:700;color:#065F46">📞 Live Phones</span>
+        </div>
+        <div>{phone_cells}</div>
     </div>"""
 
     # ── Total active (non-off, non-break) ──────────────────────────────────────
@@ -1091,6 +1775,525 @@ def build_coverage_bar_html(sched_data, act_colors=None):
             <div style="min-width:{AGENT_COL_W + total_w}px">{rows_html}</div>
         </div>
     </div>"""
+
+# ─── COVERAGE RULES (DB) ─────────────────────────────────────────────────────
+
+def get_coverage_rules():
+    """
+    Returns (agent_rules, global_rules):
+      agent_rules  : dict[agent_name -> {"allowed_channels", "lunch_slot", "lunch_duration"}]
+      global_rules : dict[key -> value_str]   e.g. {"no_back_to_back": "1"}
+    """
+    conn = get_conn()
+    agent_rows  = conn.execute("SELECT * FROM agent_coverage_rules").fetchall()
+    global_rows = conn.execute("SELECT * FROM coverage_global_rules").fetchall()
+    conn.close()
+    agent_rules  = {r["agent_name"]: dict(r) for r in agent_rows}
+    global_rules = {r["key"]: r["value"] for r in global_rows}
+    return agent_rules, global_rules
+
+
+def save_coverage_rules(agent_df, global_rules_dict):
+    """
+    Persist coverage rules from the data-editor DataFrame + global dict.
+    agent_df columns: Agent, Channels  (lunch fields now live on the agent profile)
+    Existing lunch_slot / lunch_duration values are preserved.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    # Preserve existing lunch values before wiping
+    existing_lunch = {
+        row["agent_name"]: (row["lunch_slot"], row["lunch_duration"])
+        for row in c.execute("SELECT agent_name, lunch_slot, lunch_duration FROM agent_coverage_rules").fetchall()
+    }
+    c.execute("DELETE FROM agent_coverage_rules")
+    for _, row in agent_df.iterrows():
+        ls, ld = existing_lunch.get(row["Agent"], (None, 1))
+        ch = row["Channels"]
+        # Guard against NaN (cleared selectbox) — fall back to "both"
+        if not isinstance(ch, str) or ch not in ("both", "chat", "phones", "none"):
+            ch = "both"
+        c.execute(
+            """INSERT INTO agent_coverage_rules
+               (agent_name, allowed_channels, lunch_slot, lunch_duration)
+               VALUES (?,?,?,?)""",
+            (row["Agent"], ch, ls, int(ld) if ld is not None else 1),
+        )
+    for key, val in global_rules_dict.items():
+        # Booleans → "1"/"0"; strings (slot names, etc.) → stored as-is
+        if isinstance(val, bool):
+            stored = "1" if val else "0"
+        elif val is None:
+            stored = ""
+        else:
+            stored = str(val)
+        c.execute(
+            "INSERT OR REPLACE INTO coverage_global_rules (key, value) VALUES (?,?)",
+            (key, stored),
+        )
+    conn.commit()
+    conn.close()
+
+
+def save_agent_lunch(agent_name, lunch_slot, lunch_duration):
+    """Upsert just the lunch fields for one agent in agent_coverage_rules."""
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT * FROM agent_coverage_rules WHERE agent_name=?", (agent_name,)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE agent_coverage_rules SET lunch_slot=?, lunch_duration=? WHERE agent_name=?",
+            (lunch_slot or None, int(lunch_duration), agent_name),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO agent_coverage_rules (agent_name, allowed_channels, lunch_slot, lunch_duration) VALUES (?,?,?,?)",
+            (agent_name, "both", lunch_slot or None, int(lunch_duration)),
+        )
+    conn.commit()
+    conn.close()
+
+
+# ─── GLADLY IMPORT HELPERS ────────────────────────────────────────────────────
+
+def parse_gladly_csv(file_bytes):
+    """
+    Parse a Gladly contact-level export CSV for volume signals.
+
+    Key columns (per Gladly export format):
+      Column D (index 3) = inbound / accepted timestamp
+      Column I (index 8) = channel (PHONE_CALL, CHAT, SMS, EMAIL)
+
+    Header names are detected first; if unrecognised the function falls back
+    to column positions D and I.  EMAIL rows are ignored.
+
+    Returns:
+      {"_volume": {day_of_week: {slot_str: {"Chat": N, "Phones": N}}}}
+    The single "_volume" key lets build_gladly_template aggregate via its
+    existing `for ag_data in gladly_data.values()` loop unchanged.
+    """
+    import io, csv as _csv
+    from collections import defaultdict
+
+    content = file_bytes.decode("utf-8-sig", errors="replace")
+    reader  = _csv.reader(io.StringIO(content))
+    rows    = list(reader)
+    if not rows:
+        return {}
+
+    header = [h.strip() for h in rows[0]]
+
+    def _find(*names):
+        """Return index of first matching header (case-insensitive), or None."""
+        for name in names:
+            for i, h in enumerate(header):
+                if h.lower() == name.lower():
+                    return i
+        return None
+
+    # Detect column positions; fall back to D=3 and I=8 as the user confirmed
+    time_col = _find(
+        "Inbound At", "Inbound Time", "Accepted At", "Created At",
+        "Queued At", "Contact Created At", "Start Time", "Contacted At",
+    )
+    if time_col is None:
+        time_col = 3   # column D
+
+    chan_col = _find(
+        "Channel", "Channel Type", "Contact Channel", "Channel Name",
+    )
+    if chan_col is None:
+        chan_col = 8   # column I
+
+    _TIME_FMTS = (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M",
+        "%Y-%m-%d %H:%M",
+    )
+
+    volume = defaultdict(lambda: defaultdict(lambda: {"Chat": 0, "Phones": 0}))
+    need   = max(time_col, chan_col)
+
+    for row in rows[1:]:
+        if not row or len(row) <= need:
+            continue
+
+        channel = row[chan_col].strip().upper()
+        if channel not in ("CHAT", "SMS", "PHONE_CALL"):
+            continue               # EMAIL and anything else skipped
+
+        ts = row[time_col].strip()
+        if not ts:
+            continue
+
+        # Normalise and try multiple timestamp formats
+        clean = ts.rstrip("Z").replace("T", " ").split(".")[0].strip()
+        dt = None
+        for fmt in _TIME_FMTS:
+            try:
+                dt = datetime.datetime.strptime(clean, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            continue
+
+        slot_min = 0 if dt.minute < 30 else 30
+        slot_str = datetime.time(dt.hour, slot_min).strftime("%I:%M %p").lstrip("0")
+        if slot_str not in TIME_SLOTS:
+            continue
+
+        day     = dt.strftime("%A")
+        ch_type = "Phones" if channel == "PHONE_CALL" else "Chat"
+        volume[day][slot_str][ch_type] += 1
+
+    if not volume:
+        return {}
+
+    return {"_volume": {day: dict(slots) for day, slots in volume.items()}}
+
+
+def build_gladly_template(gladly_data, db_agent_names,
+                          agent_rules=None, no_back_to_back=True,
+                          default_activities=None,
+                          agent_work_hours=None,
+                          existing_schedule=None,
+                          channel_windows=None,
+                          min_per_channel=2,
+                          max_consecutive_chat_slots=4):
+    """
+    Build per-day-of-week per-slot activity suggestions from Gladly history.
+
+    Assignment is slot-centric: for every time slot the total team Chat and
+    Phones volume is used to distribute ALL eligible agents proportionally.
+
+      agent_rules                – dict[name -> {allowed_channels, lunch_slot, lunch_duration}]
+      no_back_to_back            – insert a gap when an agent transitions Chat -> Phones directly
+      default_activities         – dict[agent_name -> activity] used for gap/break fills
+      agent_work_hours           – dict[name -> {day_index -> {start_slot, end_slot, is_active}}]
+      existing_schedule          – dict[name -> {day_index -> {slot -> activity}}]
+                                   Hard-protected slots (time off, Break, offline) are skipped.
+      channel_windows            – per-channel per-day-type open/close windows:
+                                   {
+                                     "Chat":   {"weekday": ("10:00 AM", "4:30 PM"),
+                                                "weekend": ("12:00 PM", "3:30 PM")},
+                                     "Phones": {"weekday": ("10:00 AM", "4:30 PM"),
+                                                "weekend": None},  # None = closed
+                                   }
+                                   Defaults to 10 AM-4:30 PM for both channels all days.
+      min_per_channel            – minimum agents per active channel per slot (default 2)
+      max_consecutive_chat_slots – max consecutive Chat slots before a break is inserted
+                                   (default 4 = 2 hrs). Phones have NO consecutive limit.
+
+    Returns: dict[agent_name, dict[day_of_week, dict[slot, activity_str]]]
+    """
+    if agent_rules        is None: agent_rules        = {}
+    if default_activities is None: default_activities = {}
+    if agent_work_hours   is None: agent_work_hours   = {}
+    if existing_schedule  is None: existing_schedule  = {}
+
+    _DEFAULT_WIN = ("10:00 AM", "4:30 PM")
+    if channel_windows is None:
+        channel_windows = {
+            "Chat":   {"weekday": _DEFAULT_WIN, "weekend": _DEFAULT_WIN},
+            "Phones": {"weekday": _DEFAULT_WIN, "weekend": _DEFAULT_WIN},
+        }
+
+    _LIVE     = {"Chat", "Phones"}
+    _WEEKENDS = {"Saturday", "Sunday"}
+    _si       = {s: i for i, s in enumerate(TIME_SLOTS)}
+
+    def _win_range(channel, day_type):
+        """Return (lo_idx, hi_idx) for this channel+day_type, or None if closed."""
+        w = channel_windows.get(channel, {}).get(day_type)
+        if not w:
+            return None
+        return (_si.get(w[0], 0), _si.get(w[1], len(TIME_SLOTS) - 1))
+
+    # Step 1: aggregate total volume per day-of-week per slot
+    from collections import defaultdict as _dd
+    agg = _dd(lambda: _dd(lambda: {"Chat": 0, "Phones": 0}))
+    for ag_data in gladly_data.values():
+        for day, slots in ag_data.items():
+            for slot, counts in slots.items():
+                agg[day][slot]["Chat"]   += counts.get("Chat",   0)
+                agg[day][slot]["Phones"] += counts.get("Phones", 0)
+
+    if not agg:
+        return {}
+
+    _HARD_BLOCK = {
+        ".", "",
+        "Break", "PTO", "VTO", "Sick", "Holiday",
+        "FMLA", "Bereavement", "Training", "Meeting",
+    }
+
+    # Step 2: per-agent eligibility helper (agent-level only, no channel window check)
+    def _eligible(name, di, slot):
+        """True if the agent is working and unblocked in this slot."""
+        rules  = agent_rules.get(name, {})
+        wh     = agent_work_hours.get(name, {})
+        day_wh = wh.get(di, {})
+        si     = _si.get(slot, -1)
+
+        if wh:
+            if not day_wh or not day_wh.get("is_active", False):
+                return False
+            sh_lo = _si.get(day_wh.get("start_slot", "10:00 AM"), 0)
+            sh_hi = _si.get(day_wh.get("end_slot",   "10:00 PM"), len(TIME_SLOTS) - 1)
+            sp_start = day_wh.get("split_start_slot")
+            sp_end   = day_wh.get("split_end_slot")
+            # Shift end is exclusive (consistent with base schedule slice)
+            in_primary = sh_lo <= si < sh_hi
+            if sp_start and sp_end:
+                sp_lo = _si.get(sp_start, sh_hi + 1)
+                sp_hi = _si.get(sp_end,   sh_hi + 1)
+                in_split = sp_lo <= si < sp_hi
+            else:
+                in_split = False
+            if not in_primary and not in_split:
+                return False
+            # Reserve the last 30-min slot of each work segment for Support
+            if in_primary and sh_hi - sh_lo > 1 and si == sh_hi - 1:
+                return False
+            if in_split and sp_hi - sp_lo > 1 and si == sp_hi - 1:
+                return False
+
+        cur = existing_schedule.get(name, {}).get(di, {}).get(slot, ".")
+        if cur in _HARD_BLOCK:
+            return False
+
+        lunch_sl = rules.get("lunch_slot") or None
+        lunch_d  = int(rules.get("lunch_duration", 1))
+        if lunch_sl and lunch_sl in TIME_SLOTS:
+            li = TIME_SLOTS.index(lunch_sl)
+            if li <= si < li + lunch_d:
+                return False
+
+        return True
+
+    # Step 3: slot-centric assignment
+    # Each chat agent can handle CHAT_CONCURRENCY simultaneous chats,
+    # so we cap chat assignments at ceil(chat_volume / CHAT_CONCURRENCY).
+    CHAT_CONCURRENCY = 3
+
+    template = {name: {} for name in db_agent_names}
+
+    for day in DAYS:
+        if day not in agg:
+            continue
+        di       = DAYS.index(day)
+        day_type = "weekend" if day in _WEEKENDS else "weekday"
+
+        chat_range  = _win_range("Chat",   day_type)
+        phone_range = _win_range("Phones", day_type)
+
+        for si, slot in enumerate(TIME_SLOTS):
+            # End is exclusive: the close-time slot itself is NOT a live slot
+            slot_in_chat  = chat_range  is not None and chat_range[0]  <= si < chat_range[1]
+            slot_in_phone = phone_range is not None and phone_range[0] <= si < phone_range[1]
+
+            if not slot_in_chat and not slot_in_phone:
+                continue
+
+            vol     = agg[day].get(slot) or {"Chat": 0, "Phones": 0}
+            chat_n  = vol["Chat"]   if slot_in_chat  else 0
+            phone_n = vol["Phones"] if slot_in_phone else 0
+            has_vol = chat_n > 0 or phone_n > 0
+
+            # How many agents does Chat actually need?
+            # Agents handle CHAT_CONCURRENCY chats simultaneously, so cap accordingly.
+            # Always ensure at least min_per_channel when the window is open.
+            if slot_in_chat:
+                chat_agents_cap = (max(min_per_channel, math.ceil(chat_n / CHAT_CONCURRENCY))
+                                   if chat_n > 0 else min_per_channel)
+            else:
+                chat_agents_cap = 0
+
+            chat_only, phone_only, both_agts = [], [], []
+            for name in db_agent_names:
+                if not _eligible(name, di, slot):
+                    continue
+                allowed = agent_rules.get(name, {}).get("allowed_channels", "both")
+                if allowed == "none":
+                    pass
+                elif allowed == "chat":
+                    if slot_in_chat:
+                        chat_only.append(name)
+                elif allowed == "phones":
+                    if slot_in_phone:
+                        phone_only.append(name)
+                elif allowed == "both":
+                    if slot_in_chat and slot_in_phone:
+                        both_agts.append(name)
+                    elif slot_in_chat:
+                        chat_only.append(name)
+                    elif slot_in_phone:
+                        phone_only.append(name)
+
+            if not chat_only and not phone_only and not both_agts:
+                continue
+
+            # Fixed-channel agents always get their channel
+            for n in chat_only:
+                template[n].setdefault(day, {})[slot] = "Chat"
+            for n in phone_only:
+                template[n].setdefault(day, {})[slot] = "Phones"
+
+            chat_cnt  = len(chat_only)
+            phone_cnt = len(phone_only)
+            remaining = list(both_agts)
+
+            if chat_n > 0 and phone_n > 0:
+                total_vol  = chat_n + phone_n
+                # Effective ratio using concurrency-adjusted chat demand
+                eff_chat   = math.ceil(chat_n / CHAT_CONCURRENCY)
+                eff_phone  = phone_n
+                chat_ratio = eff_chat / (eff_chat + eff_phone)
+
+                # Ensure min_per_channel for each, respecting chat cap
+                if chat_ratio >= 0.5:
+                    while chat_cnt  < min(min_per_channel, chat_agents_cap) and remaining:
+                        n = remaining.pop(0); template[n].setdefault(day, {})[slot] = "Chat";   chat_cnt  += 1
+                    while phone_cnt < min_per_channel and remaining:
+                        n = remaining.pop(0); template[n].setdefault(day, {})[slot] = "Phones"; phone_cnt += 1
+                else:
+                    while phone_cnt < min_per_channel and remaining:
+                        n = remaining.pop(0); template[n].setdefault(day, {})[slot] = "Phones"; phone_cnt += 1
+                    while chat_cnt  < min(min_per_channel, chat_agents_cap) and remaining:
+                        n = remaining.pop(0); template[n].setdefault(day, {})[slot] = "Chat";   chat_cnt  += 1
+
+                # Distribute remaining "both" agents up to each channel's need
+                for n in remaining:
+                    chat_at_cap   = (chat_cnt  >= chat_agents_cap)
+                    total_asgn    = chat_cnt + phone_cnt
+                    if chat_at_cap:
+                        # Chat is satisfied — remaining go to Phones
+                        template[n].setdefault(day, {})[slot] = "Phones"; phone_cnt += 1
+                    elif total_asgn == 0 or (chat_cnt / total_asgn) < chat_ratio:
+                        template[n].setdefault(day, {})[slot] = "Chat";   chat_cnt  += 1
+                    else:
+                        template[n].setdefault(day, {})[slot] = "Phones"; phone_cnt += 1
+
+            elif chat_n > 0 or (not has_vol and slot_in_chat):
+                # Chat-only window or no history — assign up to chat cap
+                for n in remaining:
+                    if chat_cnt < chat_agents_cap:
+                        template[n].setdefault(day, {})[slot] = "Chat"; chat_cnt += 1
+                    # Beyond cap → leave unassigned (becomes Support in post-processing)
+            elif phone_n > 0 or (not has_vol and slot_in_phone):
+                # Phone-only window or no history
+                for n in remaining:
+                    template[n].setdefault(day, {})[slot] = "Phones"
+
+    # Step 4: per-agent post-processing
+    for name in db_agent_names:
+        _gap = default_activities.get(name) or "Support"
+
+        for day in list(template[name].keys()):
+            day_tmpl = template[name][day]
+
+            # Max consecutive CHAT limit only — Phones have no limit
+            consec_chat  = 0
+            last_chat_si = -2
+            for i, slot in enumerate(TIME_SLOTS):
+                if slot not in day_tmpl:
+                    consec_chat = 0; last_chat_si = -2; continue
+                act = day_tmpl[slot]
+                if act == "Chat":
+                    consec_chat = (consec_chat + 1) if i == last_chat_si + 1 else 1
+                    if consec_chat > max_consecutive_chat_slots:
+                        day_tmpl[slot] = _gap
+                        consec_chat = 0; last_chat_si = -2
+                    else:
+                        last_chat_si = i
+                else:
+                    consec_chat = 0; last_chat_si = -2
+
+            # No back-to-back channel switch
+            if no_back_to_back:
+                to_gap = set(); prev_idx = prev_act = None
+                for i, slot in enumerate(TIME_SLOTS):
+                    if slot not in day_tmpl:
+                        prev_idx = prev_act = None; continue
+                    act = day_tmpl[slot]
+                    if (prev_act in _LIVE and act in _LIVE
+                            and prev_act != act and prev_idx == i - 1):
+                        to_gap.add(slot); prev_idx = prev_act = None; continue
+                    prev_idx = i; prev_act = act
+                for slot in to_gap:
+                    day_tmpl[slot] = _gap
+
+    # Step 5: strip empty days / agents
+    return {
+        name: {day: slots for day, slots in days.items() if slots}
+        for name, days in template.items()
+        if any(slots for slots in days.values())
+    }
+
+
+def apply_gladly_template(template, week_start, sel_date, default_activities=None):
+    """
+    Write the Gladly-derived activity suggestions to the schedule DB.
+
+    For each agent+day that appears in the template:
+      1. Sweep ALL time slots and reset any existing Chat/Phones back to the
+         agent's default activity — this clears stale live assignments from
+         previous applies that may now fall outside the channel window.
+      2. Write the new template slots on top.
+
+    Hard-protected slots (Break, PTO, etc.) are never touched in either step.
+    Returns count of live-channel slots written.
+    """
+    if default_activities is None:
+        default_activities = {}
+
+    _live      = {"Chat", "Phones"}
+    _protected = {
+        "Break", "PTO", "VTO", "Sick", "Holiday",
+        "FMLA", "Bereavement", "Training", "Meeting",
+    }
+    cells_written = 0
+
+    for agent_name, days in template.items():
+        _gap = default_activities.get(agent_name) or "Support"
+
+        for day_name, slots in days.items():
+            if day_name not in DAYS:
+                continue
+            di     = DAYS.index(day_name)
+            df_tmp = get_schedule_df(week_start, di, [agent_name])
+            changed = False
+
+            # Step 1: clear all existing Chat/Phones (replace with default activity).
+            # This removes stale live assignments outside the new channel window.
+            for slot in TIME_SLOTS:
+                if slot not in df_tmp.index:
+                    continue
+                cur = df_tmp.at[slot, agent_name]
+                if cur in _live:
+                    df_tmp.at[slot, agent_name] = _gap
+                    changed = True
+
+            # Step 2: write the new template slots.
+            for slot, activity in slots.items():
+                if slot not in df_tmp.index:
+                    continue
+                cur = df_tmp.at[slot, agent_name]
+                if cur in _protected:
+                    continue   # never overwrite time-off / breaks
+                df_tmp.at[slot, agent_name] = activity
+                cells_written += 1
+                changed = True
+
+            if changed:
+                save_schedule_df(week_start, di, df_tmp, notify=False)
+
+    return cells_written
+
 
 # ─── GLOBAL CSS ───────────────────────────────────────────────────────────────
 
@@ -1271,14 +2474,56 @@ def inject_css():
     [data-testid="stExpander"]{{border-radius:4px!important;border-color:var(--fb-iron)!important}}
     [data-testid="stExpander"] summary{{font-family:var(--font-ui)!important}}
     [data-testid="stToast"]{{font-family:var(--font-ui)!important}}
+
+    /* ── Compact schedule editor rows ── */
+    [data-testid="stDataEditor"] .ag-root-wrapper {{
+        --ag-row-height: 22px;
+        --ag-header-height: 28px;
+        --ag-line-height: 22px;
+        --ag-cell-vertical-padding: 0px;
+        --ag-font-size: 10px;
+    }}
+    [data-testid="stDataEditor"] .ag-row {{
+        height: 22px !important;
+        min-height: 22px !important;
+        max-height: 22px !important;
+        line-height: 22px !important;
+        overflow: hidden !important;
+    }}
+    [data-testid="stDataEditor"] .ag-cell,
+    [data-testid="stDataEditor"] .ag-cell-wrapper {{
+        height: 22px !important;
+        line-height: 22px !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+        font-size: 10px !important;
+        overflow: hidden !important;
+    }}
+    [data-testid="stDataEditor"] .ag-header-cell {{
+        font-size: 10px !important;
+        padding-top: 0 !important;
+        padding-bottom: 0 !important;
+    }}
+    /* Dropdown popup — full readable size regardless of cell height */
+    .ag-popup .ag-list-item {{
+        font-size: 12px !important;
+        padding: 5px 12px !important;
+        min-width: 160px !important;
+        white-space: nowrap !important;
+        line-height: 1.4 !important;
+    }}
     </style>""", unsafe_allow_html=True)
 
 def metric(label, val, sub=""):
-    st.markdown(f"""<div class="scard">
-        <div class="metric-lbl">{label}</div>
-        <div class="metric-num">{val}</div>
-        {"<div class='metric-sub'>"+sub+"</div>" if sub else ""}
-    </div>""", unsafe_allow_html=True)
+    sub_html = f"<div class='metric-sub'>{sub}</div>" if sub else ""
+    st.markdown(
+        f'<div class="scard">'
+        f'<div class="metric-lbl">{label}</div>'
+        f'<div class="metric-num">{val}</div>'
+        f'{sub_html}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 def team_pill(name, color):
     return f'<span class="team-pill" style="background:{color}22;color:{color}">{name}</span>'
@@ -1296,7 +2541,7 @@ def sidebar():
         <div style="padding:20px 16px 18px;border-bottom:1px solid rgba(255,255,255,0.07);margin-bottom:8px">
             <div style="font-family:'Cheltenham',Georgia,serif;font-size:17px;font-weight:bold;
                         color:#FFF9F4;letter-spacing:-0.01em;line-height:1.2">
-                CX Scheduler
+                CX Schedule
             </div>
             <div style="font-family:'DM Sans',Helvetica,sans-serif;font-size:10px;
                         color:#89AC9E;margin-top:4px;letter-spacing:0.15em;text-transform:uppercase">
@@ -1323,18 +2568,37 @@ def sidebar():
                 </div>
             </div>""", unsafe_allow_html=True)
 
+        # Notifications bell for agents
+        if user:
+            unread = get_notifications(user["display_name"], unread_only=True)
+            if unread:
+                notif_html = "".join(
+                    f'<div style="padding:7px 10px;border-bottom:1px solid rgba(255,255,255,0.06);'
+                    f'font-size:11px;color:#E2E8F0;font-family:\'DM Sans\',sans-serif">{n["message"]}'
+                    f'<div style="font-size:9px;color:#64748B;margin-top:2px">{n["created_at"]}</div></div>'
+                    for n in unread
+                )
+                st.markdown(
+                    f'<div style="margin:0 8px 10px;background:rgba(238,225,113,0.08);'
+                    f'border:1px solid rgba(238,225,113,0.25);border-radius:6px;overflow:hidden">'
+                    f'<div style="padding:6px 10px;font-size:10px;font-weight:700;color:#EEE171;'
+                    f'text-transform:uppercase;letter-spacing:0.06em;font-family:\'DM Sans\',sans-serif">'
+                    f'🔔 {len(unread)} new notification{"s" if len(unread) > 1 else ""}</div>'
+                    f'{notif_html}</div>',
+                    unsafe_allow_html=True
+                )
+                if st.button("Mark all read", key="mark_notif_read", use_container_width=False):
+                    mark_notifications_read(user["display_name"])
+                    st.rerun()
+
         pending = len(get_time_off_requests("Pending"))
 
         # Build nav based on role
-        nav_labels = ["⬛  Schedule"]
-        if can_edit() or True:   # Time Off visible to all (viewers submit their own)
-            nav_labels.append(f"📥  Time Off{'  ·  ' + str(pending) if pending and can_edit() else ''}")
+        nav_labels = ["⬛  Schedule", "📥  Time Off"]
         if can_edit():
-            nav_labels += ["👤  Roster", "🏷️  Teams", "📋  Templates"]
+            nav_labels += ["🌐  Agent View", "👤  Roster", "🏷️  Teams", "📋  Templates", "📊  Reports"]
         if is_admin():
-            nav_labels.append("👥  Users")
-            nav_labels.append("⚙️  Settings")
-        nav_labels.append("📊  Reports")
+            nav_labels += ["👥  Users", "⚙️  Settings"]
 
         page = st.radio("nav", nav_labels, label_visibility="collapsed")
 
@@ -1348,22 +2612,50 @@ def sidebar():
                     Time off requests</div>
             </div>""", unsafe_allow_html=True)
 
-        # Team legend
+        # Team legend — counts agents scheduled today (at least one active slot)
         teams = get_teams()
         if teams:
+            _today        = datetime.date.today()
+            _today_ws     = str(_today - datetime.timedelta(days=_today.weekday()))
+            _today_di     = _today.weekday()
+            _unscheduled  = {".", "", None}
+
             st.markdown('<div style="margin:16px 8px 6px;font-size:10px;font-weight:600;color:#475569;letter-spacing:.06em">TEAMS</div>', unsafe_allow_html=True)
             for t in teams:
-                agents_on_team = len(get_agent_names(t["name"]))
+                _team_agents = get_agent_names(t["name"])
+                _scheduled   = 0
+                if _team_agents:
+                    _df = get_schedule_df(_today_ws, _today_di, _team_agents)
+                    for _ag in _team_agents:
+                        if _ag in _df.columns and any(
+                            v not in _unscheduled for v in _df[_ag]
+                        ):
+                            _scheduled += 1
+                _total = len(_team_agents)
                 st.markdown(f"""
                 <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px">
                     <div style="width:8px;height:8px;border-radius:50%;background:{t['color']};flex-shrink:0"></div>
                     <span style="font-size:12px;color:#CBD5E1">{t['name']}</span>
-                    <span style="font-size:10px;color:#475569;margin-left:auto">{agents_on_team}</span>
+                    <span style="font-size:10px;color:#475569;margin-left:auto"
+                          title="{_scheduled} of {_total} scheduled today">{_scheduled}/{_total}</span>
                 </div>""", unsafe_allow_html=True)
 
-        # Logout at the bottom
-        st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
-        if st.button("Sign out", use_container_width=True):
+        # Logout — pushed to the very bottom of the sidebar
+        st.markdown('<div style="height:80px"></div>', unsafe_allow_html=True)
+        st.markdown(
+            '<style>'
+            '[data-testid="stSidebar"] > div:first-child {'
+            '  display:flex;flex-direction:column;'
+            '}'
+            '[data-testid="stSidebar"] [data-testid="stButton"]:last-child {'
+            '  margin-top:auto;'
+            '  padding-top:12px;'
+            '  border-top:1px solid rgba(255,255,255,0.07);'
+            '}'
+            '</style>',
+            unsafe_allow_html=True
+        )
+        if st.button("Sign out", use_container_width=True, key="signout_btn"):
             st.session_state.pop("cx_user", None)
             st.rerun()
 
@@ -1372,38 +2664,430 @@ def sidebar():
 
 # ─── PAGE: SCHEDULE ───────────────────────────────────────────────────────────
 
+def _agent_hour_breakdown(agent_name, week_start):
+    """Show a personal schedule + hour breakdown card for an agent."""
+    _INACTIVE_SET = {".", "Break", "Admin", "PTO", "VTO", "Sick",
+                     "Holiday", "Bereavement", "FMLA", "Training", "Meeting"}
+    act_colors  = get_act_colors()
+    _OFF_TYPES  = {"PTO", "VTO", "Sick", "Holiday", "Bereavement", "FMLA", "Vacation", "Personal"}
+    sel         = datetime.date.fromisoformat(week_start)
+    week_end    = sel + datetime.timedelta(days=6)
+    FONT        = "'DM Sans','Apercu Pro',Helvetica,Arial,sans-serif"
+
+    st.markdown(
+        f'<div style="font-size:18px;font-weight:700;color:#1D2019;margin-bottom:12px;'
+        f'font-family:{FONT}">Your schedule — week of {sel.strftime("%B %-d, %Y")}</div>',
+        unsafe_allow_html=True
+    )
+
+    # ── Build per-day data ─────────────────────────────────────────────────────
+    day_data   = {}   # {day: {act: hours, "_total": hours, "_off": [req, ...]}}
+    total_hrs  = 0
+    act_totals = {}   # {act: total_hours_across_week}
+
+    # Time-off requests for this agent this week
+    all_req = get_time_off_requests()
+    my_req  = [r for r in all_req
+               if r["agent_name"] == agent_name
+               and datetime.date.fromisoformat(r["start_date"]) <= week_end
+               and datetime.date.fromisoformat(r["end_date"])   >= sel]
+
+    for di, day in enumerate(DAYS):
+        date = sel + datetime.timedelta(days=di)
+        df   = get_schedule_df(week_start, di, [agent_name])
+        act_hrs = {}
+        for slot in TIME_SLOTS:
+            act = df.at[slot, agent_name]
+            if act not in _INACTIVE_SET and act != ".":
+                act_hrs[act] = act_hrs.get(act, 0) + 0.5
+        total = sum(act_hrs.values())
+        total_hrs += total
+        for a, h in act_hrs.items():
+            act_totals[a] = act_totals.get(a, 0) + h
+
+        # Time-off requests that touch this date
+        day_off = [r for r in my_req
+                   if datetime.date.fromisoformat(r["start_date"]) <= date
+                   <= datetime.date.fromisoformat(r["end_date"])]
+
+        day_data[day] = {"acts": act_hrs, "total": total, "off": day_off, "date": date}
+
+    # ── Weekly summary bar (totals by activity) ────────────────────────────────
+    if act_totals:
+        pills = ""
+        for act, hrs in sorted(act_totals.items(), key=lambda x: -x[1]):
+            bg, fg = act_colors.get(act, ("#F1F5F9", "#64748B"))
+            pills += (
+                f'<span style="background:{bg};color:{fg};padding:4px 10px;border-radius:99px;'
+                f'font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:5px;'
+                f'margin:2px 4px 2px 0;border:1px solid rgba(0,0,0,0.06);font-family:{FONT}">'
+                f'{act} <span style="opacity:0.75">{hrs:.1f}h</span></span>'
+            )
+        st.markdown(
+            f'<div style="margin-bottom:14px">'
+            f'<div style="font-size:10px;font-weight:700;color:#979797;text-transform:uppercase;'
+            f'letter-spacing:0.08em;margin-bottom:6px;font-family:{FONT}">Weekly totals</div>'
+            f'{pills}'
+            f'<span style="background:#1D2019;color:#FFF9F4;padding:4px 10px;border-radius:99px;'
+            f'font-size:11px;font-weight:700;display:inline-flex;align-items:center;gap:5px;'
+            f'margin:2px 0 2px 4px;font-family:{FONT}">'
+            f'Total <span style="color:#89AC9E">{total_hrs:.1f}h</span></span>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+    # ── Day cards ──────────────────────────────────────────────────────────────
+    cols = st.columns(len(DAYS))
+    for i, day in enumerate(DAYS):
+        d = day_data[day]
+        with cols[i]:
+            date_label = d["date"].strftime("%-m/%-d")
+            has_off    = bool(d["off"])
+            has_work   = d["total"] > 0
+
+            # Day header
+            hdr_bg = "#FEF9C3" if has_off else ("#F0F5F3" if has_work else "#F8F8F6")
+            hdr_txt = "#1D2019" if has_work or has_off else "#AAAAAA"
+            body = (
+                f'<div style="background:{hdr_bg};border:1px solid #D8D8D8;border-radius:8px;'
+                f'overflow:hidden;font-family:{FONT}">'
+                # header strip
+                f'<div style="padding:7px 8px 5px;border-bottom:1px solid #E8E8E8">'
+                f'<div style="font-size:9px;color:#979797;text-transform:uppercase;'
+                f'letter-spacing:0.08em">{day[:3]} {date_label}</div>'
+                f'<div style="font-size:18px;font-weight:700;color:{hdr_txt};line-height:1.1">'
+                f'{d["total"]:.1f}<span style="font-size:10px;font-weight:400;color:#979797"> hrs</span></div>'
+                f'</div>'
+            )
+            # Activity breakdown rows
+            if d["acts"]:
+                body += '<div style="padding:5px 8px">'
+                for act, hrs in sorted(d["acts"].items(), key=lambda x: -x[1]):
+                    bg, fg = act_colors.get(act, ("#F1F5F9", "#64748B"))
+                    bar_w  = int(min(hrs / max(d["total"], 0.5) * 100, 100))
+                    body += (
+                        f'<div style="margin-bottom:4px">'
+                        f'<div style="display:flex;justify-content:space-between;'
+                        f'font-size:9px;color:#484848;margin-bottom:1px">'
+                        f'<span>{act}</span><span style="font-weight:600">{hrs:.1f}h</span></div>'
+                        f'<div style="height:4px;background:#E8E8E8;border-radius:2px">'
+                        f'<div style="height:4px;width:{bar_w}%;background:{bg};border-radius:2px"></div>'
+                        f'</div></div>'
+                    )
+                body += '</div>'
+            # Time-off badge
+            if has_off:
+                for r in d["off"]:
+                    status_colors = {"Approved": "#16A34A", "Pending": "#D97706", "Denied": "#DC2626"}
+                    sc = status_colors.get(r["status"], "#979797")
+                    body += (
+                        f'<div style="padding:4px 8px 6px">'
+                        f'<div style="background:{sc}18;border:1px solid {sc}44;border-radius:4px;'
+                        f'padding:4px 6px;font-size:9px;color:{sc};font-weight:600">'
+                        f'{r["type"]} — {r["status"]}</div></div>'
+                    )
+            body += '</div>'
+            st.markdown(body, unsafe_allow_html=True)
+
+    st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+
+    # ── Day tabs with personal timeline ───────────────────────────────────────
+    day_tabs = st.tabs([
+        f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
+        for i, d in enumerate(DAYS)
+    ])
+    _default_to_today_tab(week_start)
+    agents_all = get_agents()
+    ag_info = next(({"name": a["name"], "team_name": a["team_name"],
+                     "color": {t["name"]: t["color"] for t in get_teams()}.get(a["team_name"], "#89AC9E")}
+                    for a in agents_all if a["name"] == agent_name), None)
+    if not ag_info:
+        st.info("Your agent profile hasn't been set up yet. Ask an admin to add you to the Roster.")
+        return
+
+    for di, tab in enumerate(day_tabs):
+        with tab:
+            df   = get_schedule_df(week_start, di, [agent_name])
+            sched = {agent_name: df[agent_name].to_dict()}
+            n_rows = len(TIME_SLOTS) * 26 + 120
+            st_components.html(
+                build_timeline_html([ag_info], sched, act_colors),
+                height=n_rows, scrolling=False
+            )
+
+
 def page_schedule():
     st.markdown('<div class="page-title">Schedule</div>', unsafe_allow_html=True)
+
+    # Play chime when today's schedule is saved
+    if st.session_state.pop("_play_schedule_sound", False):
+        st_components.html("""
+        <script>
+        (function() {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            [[659.25, 0.00], [783.99, 0.12], [1046.50, 0.24]].forEach(([freq, t]) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.type = 'sine'; osc.frequency.value = freq;
+                gain.gain.setValueAtTime(0.2, ctx.currentTime + t);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.25);
+                osc.start(ctx.currentTime + t);
+                osc.stop(ctx.currentTime + t + 0.25);
+            });
+        })();
+        </script>
+        """, height=0)
+
+    # ── Viewer (agent) sees only their own schedule ────────────────────────────
+    if not can_edit():
+        user = current_user()
+        if not user:
+            st.warning("Please log in.")
+            return
+        today = datetime.date.today()
+        default_mon = today - datetime.timedelta(days=today.weekday())
+        if "agent_sched_week" not in st.session_state:
+            st.session_state["agent_sched_week"] = default_mon
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+        with c2:
+            if st.button("⬅ Prev", key="ag_prev", use_container_width=True):
+                st.session_state["agent_sched_week"] -= datetime.timedelta(weeks=1)
+                st.rerun()
+        with c3:
+            if st.button("Next ➡", key="ag_next", use_container_width=True):
+                st.session_state["agent_sched_week"] += datetime.timedelta(weeks=1)
+                st.rerun()
+        with c1:
+            sel = st.date_input("Week", value=st.session_state["agent_sched_week"],
+                                label_visibility="collapsed", key="agent_sched_week_input")
+            if sel.weekday() != 0:
+                sel = sel - datetime.timedelta(days=sel.weekday())
+            st.session_state["agent_sched_week"] = sel
+        with c4:
+            viewer_tz_label = st.selectbox(
+                "🌐 Timezone",
+                list(_TZ_OPTIONS.keys()),
+                index=0,
+                key="viewer_timezone",
+            )
+        viewer_tz_offset    = _TZ_OPTIONS[viewer_tz_label]
+        viewer_slot_lbl_map = _make_tz_slot_label_map(viewer_tz_offset)
+        if viewer_tz_label != _BASE_TZ_LABEL:
+            sign = "+" if viewer_tz_offset >= 0 else ""
+            st.markdown(
+                f'<div style="font-size:11px;color:#64748B;margin-bottom:6px">'
+                f'Showing times in <b style="color:#0F172A">{viewer_tz_label}</b> '
+                f'({sign}{viewer_tz_offset}h from {_BASE_TZ_LABEL})</div>',
+                unsafe_allow_html=True,
+            )
+
+        week_start = str(sel)
+        my_tab, team_tab = st.tabs(["👤  My Schedule", "👥  Team View"])
+
+        with my_tab:
+            # Prefer linked_user_id match; fall back to display_name match
+            _my_agents   = get_agents()
+            _linked_agent = next((a for a in _my_agents if a.get("linked_user_id") == user["id"]), None)
+            _name_agent   = next((a for a in _my_agents if a["name"] == user["display_name"]), None)
+            _my_agent     = _linked_agent or _name_agent
+            if _my_agent:
+                _agent_hour_breakdown(_my_agent["name"], week_start)
+            else:
+                st.info("Your roster profile hasn't been set up yet, or hasn't been linked to this account. Ask an admin to add you to the Roster and link your login.")
+
+        with team_tab:
+            agents_all  = get_agents()
+            teams       = get_teams()
+            team_colors = {t["name"]: t["color"] for t in teams}
+            act_colors  = get_act_colors()
+            sched_data  = {}
+            for ag in agents_all:
+                for di in range(len(DAYS)):
+                    df = get_schedule_df(week_start, di, [ag["name"]])
+                    sched_data.setdefault(ag["name"], {}).update(df[ag["name"]].to_dict())
+
+            agents_info = [
+                {"name": a["name"], "team_name": a["team_name"],
+                 "color": team_colors.get(a["team_name"], "#64748B")}
+                for a in agents_all
+            ]
+            teams_with_agents = [t for t in teams
+                                 if any(a["team_name"] == t["name"] for a in agents_info)]
+            _ordered_teams, _tl_order_key = resolve_team_order(user, teams_with_agents)
+            n_rows = len(TIME_SLOTS) * 26 + 120
+
+            day_tabs = st.tabs([
+                f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
+                for i, d in enumerate(DAYS)
+            ])
+            _default_to_today_tab(week_start)
+            for di, dtab in enumerate(day_tabs):
+                with dtab:
+                    day_sched = {}
+                    for ag in agents_all:
+                        df = get_schedule_df(week_start, di, [ag["name"]])
+                        day_sched[ag["name"]] = df[ag["name"]].to_dict()
+
+                    for _i, team in enumerate(_ordered_teams):
+                        team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
+                        if not team_agents:
+                            continue
+                        _hcol, _ucol, _dcol = st.columns([30, 1, 1])
+                        with _hcol:
+                            st.markdown(
+                                f'<div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">'
+                                f'<div style="width:10px;height:10px;border-radius:50%;background:{team["color"]}"></div>'
+                                f'<span style="font-size:13px;font-weight:600;color:#1E293B">{team["name"]} Team</span>'
+                                f'<span style="font-size:11px;color:#94A3B8">— {len(team_agents)} agents</span>'
+                                f'</div>', unsafe_allow_html=True
+                            )
+                        with _ucol:
+                            if st.button("↑", key=f"tv_up_{di}_{team['name']}",
+                                         disabled=(_i == 0), help="Move up"):
+                                _ord = st.session_state[_tl_order_key]
+                                _idx = _ord.index(team["name"])
+                                _ord[_idx], _ord[_idx-1] = _ord[_idx-1], _ord[_idx]
+                                save_user_team_order(user["id"], _ord)
+                                st.rerun()
+                        with _dcol:
+                            if st.button("↓", key=f"tv_dn_{di}_{team['name']}",
+                                         disabled=(_i == len(_ordered_teams)-1), help="Move down"):
+                                _ord = st.session_state[_tl_order_key]
+                                _idx = _ord.index(team["name"])
+                                _ord[_idx], _ord[_idx+1] = _ord[_idx+1], _ord[_idx]
+                                save_user_team_order(user["id"], _ord)
+                                st.rerun()
+                        team_sched = {a["name"]: day_sched.get(a["name"], {}) for a in team_agents}
+                        st_components.html(
+                            build_timeline_html(team_agents, team_sched, act_colors,
+                                                slot_label_map=viewer_slot_lbl_map),
+                            height=n_rows, scrolling=False
+                        )
+        return
 
     today = datetime.date.today()
     default_mon = today - datetime.timedelta(days=today.weekday())
 
-    c1, c2, c3, c4, c5 = st.columns([2, 1.2, 1.2, 1.2, 2])
-    with c1:
-        sel = st.date_input("Week starting (Monday)", value=default_mon, label_visibility="collapsed")
-        if sel.weekday() != 0:
-            sel = sel - datetime.timedelta(days=sel.weekday())
-        week_start = str(sel)
-        st.markdown(f'<div style="font-size:13px;color:#64748B;margin-top:2px">Week of <b style="color:#0F172A">{sel.strftime("%B %-d, %Y")}</b></div>', unsafe_allow_html=True)
+    # ── Week navigation via session state (fixes prev/next not sticking) ───────
+    if "sched_week" not in st.session_state:
+        st.session_state["sched_week"] = default_mon
+
+    c1, c2, c3, c4 = st.columns([2, 1.2, 1.2, 1.2])
     with c2:
         if st.button("⬅ Prev week", use_container_width=True):
-            sel -= datetime.timedelta(weeks=1)
+            st.session_state["sched_week"] -= datetime.timedelta(weeks=1)
             st.rerun()
     with c3:
         if st.button("Next week ➡", use_container_width=True):
-            sel += datetime.timedelta(weeks=1)
+            st.session_state["sched_week"] += datetime.timedelta(weeks=1)
             st.rerun()
+    with c1:
+        sel = st.date_input(
+            "Week starting (Monday)",
+            value=st.session_state["sched_week"],
+            label_visibility="collapsed",
+            key="sched_week_input",
+        )
+        if sel.weekday() != 0:
+            sel = sel - datetime.timedelta(days=sel.weekday())
+        # Keep session state in sync if user picks manually
+        st.session_state["sched_week"] = sel
+        week_start = str(sel)
+        st.markdown(
+            f'<div style="font-size:13px;color:#64748B;margin-top:2px">'
+            f'Week of <b style="color:#0F172A">{sel.strftime("%B %-d, %Y")}</b></div>',
+            unsafe_allow_html=True
+        )
     with c4:
         if st.button("📋 Copy prev week", use_container_width=True):
             prev = str(sel - datetime.timedelta(weeks=1))
             ok, msg = copy_week(prev, week_start)
             st.toast(msg, icon="✅" if ok else "⚠️")
             st.rerun()
-    with c5:
-        if st.button("✨  Apply approved time off", use_container_width=True, type="primary"):
-            n = apply_approved_timeoff(week_start)
-            st.toast(f"Applied time off to {n} time slots.", icon="✅")
-            st.rerun()
+
+    # ── Base schedule generator ────────────────────────────────────────────────
+    with st.expander("🗓  Generate base schedule", expanded=False):
+        st.markdown(
+            '<div style="font-size:12px;color:#484848;margin-bottom:10px">'
+            'Fills each agent\'s shift hours with their team\'s default activity. '
+            'Set shift times in <b>Roster → agent card → Shift hours</b> and '
+            'default activities in <b>Teams → Edit team</b>.</div>',
+            unsafe_allow_html=True
+        )
+
+        # Show readiness status for every agent
+        all_agents   = get_agents()
+        agents_ready = []
+        agents_missing = []
+        for ag in all_agents:
+            default_act = get_agent_default_activity(ag["name"])
+            wh          = get_agent_work_hours(ag["name"])
+            active_days = [d for d, cfg in wh.items() if cfg["is_active"]]
+            if default_act and active_days:
+                agents_ready.append((ag["name"], default_act, active_days))
+            else:
+                reason = []
+                if not default_act:   reason.append("no default activity")
+                if not active_days:   reason.append("no shift hours saved")
+                agents_missing.append((ag["name"], ", ".join(reason)))
+
+        rc1, rc2 = st.columns(2)
+        with rc1:
+            if agents_ready:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:#16A34A;margin-bottom:4px">'
+                    f'✅ {len(agents_ready)} agent(s) configured</div>'
+                    + "".join(
+                        f'<div style="font-size:11px;color:#484848;margin-bottom:1px">'
+                        f'• {name} <span style="color:#89AC9E">{act}</span> '
+                        f'— {len(days)} day(s)</div>'
+                        for name, act, days in agents_ready[:10]
+                    )
+                    + (f'<div style="font-size:10px;color:#979797">…and {len(agents_ready)-10} more</div>'
+                       if len(agents_ready) > 10 else ""),
+                    unsafe_allow_html=True
+                )
+            else:
+                st.warning("No agents configured yet. Set shift hours in Roster and default activities in Teams.")
+
+        with rc2:
+            if agents_missing:
+                st.markdown(
+                    f'<div style="font-size:11px;font-weight:700;color:#D97706;margin-bottom:4px">'
+                    f'⚠ {len(agents_missing)} agent(s) need setup</div>'
+                    + "".join(
+                        f'<div style="font-size:11px;color:#979797;margin-bottom:1px">'
+                        f'• {name}: {reason}</div>'
+                        for name, reason in agents_missing[:10]
+                    ),
+                    unsafe_allow_html=True
+                )
+
+        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+        gc1, gc2, gc3 = st.columns([2, 2, 1])
+        with gc1:
+            overwrite_mode = st.radio(
+                "Existing slots:",
+                ["Keep existing (only fill empty slots)", "Overwrite everything"],
+                key=f"bs_overwrite_{week_start}",
+            )
+        with gc3:
+            st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
+            gen_clicked = st.button(
+                "Generate",
+                type="primary",
+                use_container_width=True,
+                key=f"gen_base_{week_start}",
+                disabled=len(agents_ready) == 0,
+            )
+        if gen_clicked:
+            overwrite = overwrite_mode.startswith("Overwrite")
+            n = apply_base_schedule(week_start, overwrite=overwrite)
+            if n > 0:
+                st.success(f"✅ Base schedule generated — {n} slot(s) filled for week of {sel.strftime('%B %-d')}.")
+            else:
+                st.info("No slots were filled. If using 'Keep existing', all slots may already be set. Try 'Overwrite everything' to reset.")
 
     # ── Template controls ─────────────────────────────────────────────────────
     if can_edit():
@@ -1460,12 +3144,339 @@ def page_schedule():
                             )
                             st.toast(msg, icon="✅" if ok else "⚠️")
 
-    st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
+    # ── Coverage rules ────────────────────────────────────────────────────────
+    if can_edit():
+        with st.expander("⚙️  Live coverage rules", expanded=False):
+            st.markdown(
+                '<div style="font-size:12px;color:#484848;margin-bottom:12px">'
+                'Set per-agent channel capabilities and lunch times. These rules are applied '
+                'automatically whenever you generate a Gladly Live coverage template.</div>',
+                unsafe_allow_html=True,
+            )
 
-    day_tabs = st.tabs([
-        f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
-        for i, d in enumerate(DAYS)
-    ])
+            _agent_rules_db, _global_rules_db = get_coverage_rules()
+            _all_roster = get_agents()
+
+            # Build DataFrame for data_editor
+            _CHANNEL_OPTIONS = ["Both", "Chat only", "Phones only", "None"]
+
+            _rows = []
+            for ag in _all_roster:
+                r = _agent_rules_db.get(ag["name"], {})
+                ch_raw = r.get("allowed_channels", "both")
+                ch_display = (
+                    "Chat only"   if ch_raw == "chat"   else
+                    "Phones only" if ch_raw == "phones" else
+                    "None"        if ch_raw == "none"   else
+                    "Both"
+                )
+                _rows.append({"Agent": ag["name"], "Channels": ch_display})
+
+            import pandas as _pd
+            _rules_df = _pd.DataFrame(_rows)
+
+            _edited = st.data_editor(
+                _rules_df,
+                use_container_width=True,
+                hide_index=True,
+                key=f"coverage_rules_editor_{week_start}",
+                column_config={
+                    "Agent": st.column_config.TextColumn("Agent", disabled=True),
+                    "Channels": st.column_config.SelectboxColumn(
+                        "Channels",
+                        options=_CHANNEL_OPTIONS,
+                        help="Which live channels this agent can handle",
+                    ),
+                },
+            )
+            st.caption("Lunch slot and duration are now configured per agent in the Roster page.")
+
+            _nbb_default = _global_rules_db.get("no_back_to_back", "1") == "1"
+            _no_bb = st.checkbox(
+                "🔄  No back-to-back channel switches — insert a gap whenever an agent "
+                "would go directly from Chat → Phones or Phones → Chat",
+                value=_nbb_default,
+                key=f"no_back_to_back_{week_start}",
+            )
+
+            st.markdown("---")
+            st.markdown("**📅 Channel Windows**")
+            st.caption(
+                "Define when each channel is open. The template only assigns live coverage "
+                "within these windows. Weekend = Saturday & Sunday."
+            )
+
+            def _slot_idx(key, default):
+                v = _global_rules_db.get(key, "")
+                return TIME_SLOTS.index(v) if v in TIME_SLOTS else TIME_SLOTS.index(default)
+
+            _cw_cols = st.columns([1, 1])
+            with _cw_cols[0]:
+                st.markdown("**Weekday (Mon–Fri)**")
+                _cwdo = st.selectbox("Chat open",    TIME_SLOTS, index=_slot_idx("chat_wkday_open",   "10:00 AM"), key=f"cwdo_{week_start}")
+                _cwdc = st.selectbox("Chat close",   TIME_SLOTS, index=_slot_idx("chat_wkday_close",  "4:30 PM"),  key=f"cwdc_{week_start}")
+                _pwdo = st.selectbox("Phones open",  TIME_SLOTS, index=_slot_idx("phones_wkday_open", "10:00 AM"), key=f"pwdo_{week_start}")
+                _pwdc = st.selectbox("Phones close", TIME_SLOTS, index=_slot_idx("phones_wkday_close","4:30 PM"),  key=f"pwdc_{week_start}")
+            with _cw_cols[1]:
+                st.markdown("**Weekend (Sat–Sun)**")
+                _cweo = st.selectbox("Chat open",    TIME_SLOTS, index=_slot_idx("chat_wkend_open",   "12:00 PM"), key=f"cweo_{week_start}")
+                _cwec = st.selectbox("Chat close",   TIME_SLOTS, index=_slot_idx("chat_wkend_close",  "3:30 PM"),  key=f"cwec_{week_start}")
+                _phones_wkend_closed = st.checkbox(
+                    "Phones closed on weekends",
+                    value=_global_rules_db.get("phones_wkend_closed", "1") == "1",
+                    key=f"pweclosed_{week_start}",
+                )
+                if not _phones_wkend_closed:
+                    _pweo = st.selectbox("Phones open",  TIME_SLOTS, index=_slot_idx("phones_wkend_open",  "10:00 AM"), key=f"pweo_{week_start}")
+                    _pwec = st.selectbox("Phones close", TIME_SLOTS, index=_slot_idx("phones_wkend_close", "4:30 PM"),  key=f"pwec_{week_start}")
+                else:
+                    _pweo = _pwec = ""
+
+            if st.button("💾  Save rules", key=f"save_rules_{week_start}", type="primary"):
+                # Normalise display → DB values
+                _to_save = _edited.copy()
+                _to_save["Channels"] = _to_save["Channels"].map({
+                    "Both": "both", "Chat only": "chat",
+                    "Phones only": "phones", "None": "none",
+                })
+                save_coverage_rules(_to_save, {
+                    "no_back_to_back":      _no_bb,
+                    "chat_wkday_open":      _cwdo,
+                    "chat_wkday_close":     _cwdc,
+                    "phones_wkday_open":    _pwdo,
+                    "phones_wkday_close":   _pwdc,
+                    "chat_wkend_open":      _cweo,
+                    "chat_wkend_close":     _cwec,
+                    "phones_wkend_closed":  _phones_wkend_closed,
+                    "phones_wkend_open":    _pweo,
+                    "phones_wkend_close":   _pwec,
+                })
+                # Bust the Gladly template cache so rules take effect immediately
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith("gladly_tmpl_") or _k.startswith("gladly_raw_"):
+                        del st.session_state[_k]
+                st.toast("Coverage rules saved.", icon="✅")
+                st.rerun()
+
+    # ── Gladly volume import → coverage template ──────────────────────────────
+    if can_edit():
+        with st.expander("📊  Gladly import → Live coverage template", expanded=False):
+            st.markdown(
+                '<div style="font-size:12px;color:#484848;margin-bottom:12px">'
+                'Upload a Gladly contact export (CSV). The template is built from '
+                'aggregate Chat/Phone volume and applied only to the selected team. '
+                'Channel windows and shift hours are applied per agent. '
+                'Only blank and existing Chat/Phones slots are overwritten.</div>',
+                unsafe_allow_html=True,
+            )
+
+            # ── Team selector (default: Support Team) ────────────────────
+            _gl_teams     = get_teams()
+            _gl_team_names = [t["name"] for t in _gl_teams]
+            _gl_def_idx   = next(
+                (i for i, n in enumerate(_gl_team_names) if "support" in n.lower()), 0
+            )
+            _gl_sel_team = st.selectbox(
+                "Apply to team:",
+                _gl_team_names,
+                index=_gl_def_idx,
+                key=f"gladly_team_{week_start}",
+            )
+
+            gl_file = st.file_uploader(
+                "Gladly contact export CSV",
+                type=["csv"],
+                key=f"gladly_upload_{week_start}",
+                label_visibility="collapsed",
+            )
+
+            if gl_file is not None:
+                # CSV parse is team-independent; template is team-specific.
+                # Include file size in keys so re-uploading the same filename
+                # triggers a fresh parse rather than serving a stale cache.
+                _gl_fsize  = gl_file.size
+                _TMPL_VER  = "v7"   # bump when build_gladly_template logic changes
+                raw_key    = f"gladly_raw_{week_start}_{gl_file.name}_{_gl_fsize}"
+                cache_key  = f"gladly_tmpl_{_TMPL_VER}_{week_start}_{gl_file.name}_{_gl_fsize}_{_gl_sel_team}"
+
+                if raw_key not in st.session_state:
+                    with st.spinner("Parsing Gladly report…"):
+                        st.session_state[raw_key] = parse_gladly_csv(gl_file.read())
+
+                if cache_key not in st.session_state:
+                    with st.spinner("Building live coverage template…"):
+                        _all_agents  = get_agents()
+                        db_agents    = [
+                            a["name"] for a in _all_agents
+                            if a.get("team_name") == _gl_sel_team
+                        ]
+                        _ag_rules, _gl_rules = get_coverage_rules()
+                        _no_bb = _gl_rules.get("no_back_to_back", "1") == "1"
+                        _def_acts = {
+                            ag: get_agent_default_activity(ag) or "Support"
+                            for ag in db_agents
+                        }
+                        # Load each agent's configured shift hours
+                        _agent_wh = {
+                            ag: get_agent_work_hours(ag) for ag in db_agents
+                        }
+                        # Load current schedule so the builder skips time off,
+                        # lunch/break, and any other already-filled slots
+                        _existing = {}
+                        for _ag in db_agents:
+                            _existing[_ag] = {}
+                            for _di in range(len(DAYS)):
+                                _df = get_schedule_df(week_start, _di, [_ag])
+                                _existing[_ag][_di] = _df[_ag].to_dict()
+                        # Load channel windows from saved rules
+                        def _slot_or(key, default):
+                            v = _gl_rules.get(key, "")
+                            return v if v in TIME_SLOTS else default
+                        _phones_wkend_closed = _gl_rules.get("phones_wkend_closed", "1") == "1"
+                        _channel_windows = {
+                            "Chat": {
+                                "weekday": (_slot_or("chat_wkday_open",  "10:00 AM"),
+                                            _slot_or("chat_wkday_close", "4:30 PM")),
+                                "weekend": (_slot_or("chat_wkend_open",  "12:00 PM"),
+                                            _slot_or("chat_wkend_close", "3:30 PM")),
+                            },
+                            "Phones": {
+                                "weekday": (_slot_or("phones_wkday_open",  "10:00 AM"),
+                                            _slot_or("phones_wkday_close", "4:30 PM")),
+                                "weekend": None if _phones_wkend_closed else
+                                           (_slot_or("phones_wkend_open",  "10:00 AM"),
+                                            _slot_or("phones_wkend_close", "4:30 PM")),
+                            },
+                        }
+                        tmpl = build_gladly_template(
+                            st.session_state[raw_key],
+                            db_agents,
+                            agent_rules=_ag_rules,
+                            no_back_to_back=_no_bb,
+                            default_activities=_def_acts,
+                            agent_work_hours=_agent_wh,
+                            existing_schedule=_existing,
+                            channel_windows=_channel_windows,
+                        )
+                        st.session_state[cache_key] = tmpl
+
+                raw_data = st.session_state.get(raw_key, {})
+                tmpl     = st.session_state.get(cache_key, {})
+
+                # ── Volume summary (total contacts per day per channel) ──────
+                from collections import defaultdict as _dd
+                day_totals = _dd(lambda: {"Chat": 0, "Phones": 0})
+                for ag_data in raw_data.values():
+                    for day, slots in ag_data.items():
+                        for counts in slots.values():
+                            day_totals[day]["Chat"]   += counts.get("Chat", 0)
+                            day_totals[day]["Phones"]  += counts.get("Phones", 0)
+
+                if day_totals:
+                    st.markdown(
+                        '<div style="font-size:10px;font-weight:700;color:#689985;'
+                        'letter-spacing:0.12em;text-transform:uppercase;margin:8px 0 4px">'
+                        'Volume from uploaded report (answered contacts)</div>',
+                        unsafe_allow_html=True,
+                    )
+                    vol_rows = ""
+                    for day in DAYS:
+                        if day not in day_totals:
+                            continue
+                        c = day_totals[day]["Chat"]
+                        p = day_totals[day]["Phones"]
+                        vol_rows += (
+                            f'<tr><td style="padding:3px 10px;font-size:11px;color:#334155">{day[:3]}</td>'
+                            f'<td style="padding:3px 10px;font-size:11px;color:#1D4ED8;text-align:right">💬 {c}</td>'
+                            f'<td style="padding:3px 10px;font-size:11px;color:#065F46;text-align:right">📞 {p}</td></tr>'
+                        )
+                    st.markdown(
+                        f'<table style="border-collapse:collapse;margin-bottom:10px">'
+                        f'<thead><tr>'
+                        f'<th style="font-size:10px;color:#94A3B8;padding:2px 10px;text-align:left">Day</th>'
+                        f'<th style="font-size:10px;color:#94A3B8;padding:2px 10px;text-align:right">Chat / SMS</th>'
+                        f'<th style="font-size:10px;color:#94A3B8;padding:2px 10px;text-align:right">Phone calls</th>'
+                        f'</tr></thead><tbody>{vol_rows}</tbody></table>',
+                        unsafe_allow_html=True,
+                    )
+
+                # ── Template preview ─────────────────────────────────────────
+                if tmpl:
+                    total_agents      = len(tmpl)
+                    total_suggestions = sum(
+                        len(slots) for days in tmpl.values() for slots in days.values()
+                    )
+                    st.markdown(
+                        f'<div style="font-size:11px;color:#0F172A;margin-bottom:8px">'
+                        f'<b>{_gl_sel_team}</b> · <b>{total_agents}</b> agent(s) · '
+                        f'<b>{total_suggestions}</b> slot suggestions · '
+                        f'live window 10 AM – 5 PM · shift hours applied</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    # Show per-agent preview for the currently-selected week's days
+                    preview_rows = ""
+                    for ag_name in sorted(tmpl.keys()):
+                        day_cells = ""
+                        for day in DAYS:
+                            slots = tmpl[ag_name].get(day, {})
+                            if not slots:
+                                day_cells += '<td style="padding:2px 6px;font-size:10px;color:#CBD5E1;text-align:center">—</td>'
+                                continue
+                            chat_n   = sum(1 for v in slots.values() if v == "Chat")
+                            phones_n = sum(1 for v in slots.values() if v == "Phones")
+                            parts = []
+                            if chat_n:
+                                parts.append(f'<span style="color:#1D4ED8">💬{chat_n}</span>')
+                            if phones_n:
+                                parts.append(f'<span style="color:#065F46">📞{phones_n}</span>')
+                            day_cells += f'<td style="padding:2px 6px;font-size:10px;text-align:center">{"&nbsp;".join(parts)}</td>'
+                        preview_rows += (
+                            f'<tr><td style="padding:2px 10px;font-size:11px;color:#334155;'
+                            f'white-space:nowrap">{ag_name}</td>{day_cells}</tr>'
+                        )
+
+                    day_headers = "".join(
+                        f'<th style="font-size:10px;color:#94A3B8;padding:2px 6px;text-align:center">{d[:3]}</th>'
+                        for d in DAYS
+                    )
+                    st.markdown(
+                        f'<div style="overflow-x:auto;max-height:300px;overflow-y:auto;'
+                        f'border:1px solid #E2E8F0;border-radius:6px">'
+                        f'<table style="border-collapse:collapse;width:100%">'
+                        f'<thead style="position:sticky;top:0;background:#F8FAFC;z-index:1"><tr>'
+                        f'<th style="font-size:10px;color:#94A3B8;padding:4px 10px;text-align:left">Agent</th>'
+                        f'{day_headers}</tr></thead>'
+                        f'<tbody>{preview_rows}</tbody></table></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+                    if st.button(
+                        f"✅  Apply Live template to week of {sel.strftime('%B %-d')}",
+                        type="primary",
+                        use_container_width=False,
+                        key=f"gladly_apply_{week_start}",
+                    ):
+                        _apply_def_acts = {
+                            ag: get_agent_default_activity(ag) or "Support"
+                            for ag in tmpl.keys()
+                        }
+                        n = apply_gladly_template(tmpl, week_start, sel,
+                                                  default_activities=_apply_def_acts)
+                        st.toast(
+                            f"Applied Gladly template — {n} slot(s) filled for week of {sel.strftime('%B %-d')}.",
+                            icon="✅",
+                        )
+                        st.rerun()
+                else:
+                    st.info(
+                        "No Chat, SMS, or Phone call contacts found in this report. "
+                        "Make sure the CSV includes live-channel contacts with "
+                        "Status = ANSWERED."
+                    )
+
+    st.markdown('<div style="height:12px"></div>', unsafe_allow_html=True)
 
     agents_all  = get_agents()
     teams       = get_teams()
@@ -1473,229 +3484,452 @@ def page_schedule():
     act_names   = get_activity_names()   # dynamic from DB
     act_colors  = get_act_colors()       # dynamic from DB
 
-    for di, (tab, day_name) in enumerate(zip(day_tabs, DAYS)):
-        with tab:
+    # ── Custom day selector (replaces st.tabs so only ONE day renders at a time,
+    #    eliminating multi-iframe interference with the schedule editor component) ──
+    _active_day_key = f"active_sched_day_{week_start}"
+    if _active_day_key not in st.session_state:
+        # Default to today when viewing the current week, else Monday
+        _today = datetime.date.today()
+        _cur_mon = str(_today - datetime.timedelta(days=_today.weekday()))
+        _default_di = _today.weekday() if week_start == _cur_mon else 0
+        st.session_state[_active_day_key] = _default_di
+
+    _day_btn_cols = st.columns(len(DAYS))
+    for _dbi, (_dbc, _dbn) in enumerate(zip(_day_btn_cols, DAYS)):
+        _date_lbl = (sel + datetime.timedelta(days=_dbi)).strftime('%-m/%-d')
+        with _dbc:
+            if st.button(
+                f"{_dbn[:3]}  {_date_lbl}",
+                key=f"daybtn_{week_start}_{_dbi}",
+                type="primary" if st.session_state[_active_day_key] == _dbi else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state[_active_day_key] = _dbi
+                st.rerun()
+
+    st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+
+    # Declare the schedule editor component ONCE, unconditionally.
+    _eport = _launch_editor_server()
+    _sched_editor = st_components.declare_component(
+        "cx_schedule_editor",
+        url=f"http://localhost:{_eport}",
+    )
+
+    # Render only the active day — a single pass, no loop
+    di       = st.session_state[_active_day_key]
+    day_name = DAYS[di]
+    with st.container():
             # Load saved schedule data for all agents on this day
             sched_data = {}
             for ag in agents_all:
                 df_tmp = get_schedule_df(week_start, di, [ag["name"]])
                 sched_data[ag["name"]] = df_tmp[ag["name"]].to_dict()
 
-            # ── Coverage bar — always visible at the top ───────────────────────
-            if agents_all:
-                n_scheduled = sum(
-                    1 for ag_s in sched_data.values()
-                    if any(v not in (".", "") for v in ag_s.values())
-                )
-                on_q_peak = max(
-                    (sum(1 for ag_s in sched_data.values()
-                         if ag_s.get(s, ".") in _ON_QUEUE)
-                     for s in TIME_SLOTS),
-                    default=0,
-                )
-                total_agents = len(agents_all)
-                st.markdown(
-                    f'<div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">'
-                    f'<span style="font-size:12px;color:#475569">👥 <b style="color:#0F172A">{total_agents}</b> agents total</span>'
-                    f'<span style="font-size:12px;color:#475569">📋 <b style="color:#0F172A">{n_scheduled}</b> have shifts entered</span>'
-                    f'<span style="font-size:12px;color:#1D4ED8">🎧 Peak on queue: <b>{on_q_peak}</b></span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-                cov_html = build_coverage_bar_html(sched_data, act_colors)
-                if cov_html:
-                    st.markdown(cov_html, unsafe_allow_html=True)
-                else:
-                    st.caption("No schedule data yet — use the Edit tab to build this day's schedule.")
+            # ── View toggle (session-state so Edit persists after save) ──────
+            # Single view key shared across all days in this week —
+            # switching tabs preserves whichever view (timeline / edit) is active.
+            _view_key = f"sched_view_{week_start}"
+            if _view_key not in st.session_state:
+                st.session_state[_view_key] = "timeline"
 
-            tab_list = ["👁  Timeline view"]
+            _vt1, _vt2, _vtspc = st.columns([1, 1, 5])
+            with _vt1:
+                if st.button("👁  Timeline", key=f"vtl_{week_start}_{di}",
+                             type="primary" if st.session_state[_view_key] == "timeline" else "secondary",
+                             use_container_width=True):
+                    st.session_state[_view_key] = "timeline"
+                    st.rerun()
             if can_edit():
-                tab_list.append("✏️  Edit schedule")
-            tabs_out = st.tabs(tab_list)
-            view_tab = tabs_out[0]
-            edit_tab = tabs_out[1] if can_edit() else None
+                with _vt2:
+                    if st.button("✏️  Edit", key=f"ved_{week_start}_{di}",
+                                 type="primary" if st.session_state[_view_key] == "edit" else "secondary",
+                                 use_container_width=True):
+                        st.session_state[_view_key] = "edit"
+                        st.rerun()
 
-            with view_tab:
+            # shared team/agent info
+            agents_info = [
+                {"name": a["name"], "team_name": a["team_name"],
+                 "color": team_colors.get(a["team_name"], "#64748B")}
+                for a in agents_all
+            ]
+            teams_with_agents = [t for t in teams
+                                  if any(a["team_name"] == t["name"] for a in agents_info)]
+            _cu = current_user()
+            _ordered_teams, _tl_order_key = resolve_team_order(_cu, teams_with_agents)
+
+            # ── TIMELINE VIEW ─────────────────────────────────────────────────
+            if st.session_state[_view_key] == "timeline":
                 if not agents_all:
                     st.info("Add agents in the Roster page to see the schedule.")
                 else:
-                    agents_info = [
-                        {"name": a["name"], "team_name": a["team_name"],
-                         "color": team_colors.get(a["team_name"], "#64748B")}
-                        for a in agents_all
-                    ]
-
-                    # ── Team order (persisted in session state) ───────────────
-                    teams_with_agents = [t for t in teams
-                                         if any(a["team_name"] == t["name"] for a in agents_info)]
-                    _tl_order_key = "timeline_team_order"
-                    if _tl_order_key not in st.session_state:
-                        st.session_state[_tl_order_key] = [t["name"] for t in teams_with_agents]
-                    else:
-                        # Keep order in sync: add new teams, drop removed ones
-                        _cur = {t["name"] for t in teams_with_agents}
-                        _saved = [n for n in st.session_state[_tl_order_key] if n in _cur]
-                        _new   = [t["name"] for t in teams_with_agents
-                                  if t["name"] not in set(_saved)]
-                        st.session_state[_tl_order_key] = _saved + _new
-
-                    _team_lookup  = {t["name"]: t for t in teams}
-                    _ordered_teams = [_team_lookup[n] for n in st.session_state[_tl_order_key]
-                                      if n in _team_lookup]
-
-                    # Group by team with headers + reorder buttons
-                    n_rows = len(TIME_SLOTS) * 26 + 60
+                    n_rows = len(TIME_SLOTS) * 26 + 120
                     for _i, team in enumerate(_ordered_teams):
                         team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
                         if not team_agents:
                             continue
-
-                        # Header row: dot + name + agent count + ↑ ↓ buttons
                         _hcol, _ucol, _dcol = st.columns([30, 1, 1])
                         with _hcol:
                             st.markdown(
-                                f'<div style="display:flex;align-items:center;gap:8px;'
-                                f'margin:10px 0 4px">'
-                                f'<div style="width:10px;height:10px;border-radius:50%;'
-                                f'background:{team["color"]}"></div>'
-                                f'<span style="font-size:13px;font-weight:600;color:#1E293B">'
-                                f'{team["name"]} Team</span>'
-                                f'<span style="font-size:11px;color:#94A3B8">'
-                                f'— {len(team_agents)} agents</span>'
+                                f'<div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">'
+                                f'<div style="width:10px;height:10px;border-radius:50%;background:{team["color"]}"></div>'
+                                f'<span style="font-size:13px;font-weight:600;color:#1E293B">{team["name"]} Team</span>'
+                                f'<span style="font-size:11px;color:#94A3B8">— {len(team_agents)} agents</span>'
                                 f'</div>', unsafe_allow_html=True
                             )
                         with _ucol:
-                            _up_disabled = (_i == 0)
                             if st.button("↑", key=f"tl_up_{di}_{team['name']}",
-                                         disabled=_up_disabled,
-                                         help="Move this team up"):
+                                         disabled=(_i == 0), help="Move this team up"):
                                 _order = st.session_state[_tl_order_key]
                                 _idx   = _order.index(team["name"])
                                 _order[_idx], _order[_idx - 1] = _order[_idx - 1], _order[_idx]
+                                save_user_team_order(_cu["id"], _order)
                                 st.rerun()
                         with _dcol:
-                            _dn_disabled = (_i == len(_ordered_teams) - 1)
                             if st.button("↓", key=f"tl_dn_{di}_{team['name']}",
-                                         disabled=_dn_disabled,
+                                         disabled=(_i == len(_ordered_teams) - 1),
                                          help="Move this team down"):
                                 _order = st.session_state[_tl_order_key]
                                 _idx   = _order.index(team["name"])
                                 _order[_idx], _order[_idx + 1] = _order[_idx + 1], _order[_idx]
+                                save_user_team_order(_cu["id"], _order)
                                 st.rerun()
-
                         team_sched = {a["name"]: sched_data.get(a["name"], {}) for a in team_agents}
                         timeline_html = build_timeline_html(team_agents, team_sched, act_colors)
-                        st_components.html(timeline_html, height=min(n_rows, 680), scrolling=True)
+                        st_components.html(timeline_html, height=n_rows, scrolling=False)
                         st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
-            if can_edit() and edit_tab is not None:
-              with edit_tab:
-                # ── Quick Fill ──────────────────────────────────────────────────
-                st.markdown(
-                    '<div style="background:#F0F5F3;border:1px solid #C4D9D2;border-radius:4px;'
-                    'padding:12px 16px;margin-bottom:14px">'
-                    '<div style="font-size:10px;font-weight:700;color:#689985;margin-bottom:10px;'
-                    'letter-spacing:0.12em;text-transform:uppercase;font-family:\'DM Sans\',sans-serif">'
-                    'Quick Fill — set one activity across multiple slots and agents</div>',
-                    unsafe_allow_html=True,
-                )
-                qf_c1, qf_c2, qf_c3, qf_c4, qf_c5 = st.columns([2, 2, 2, 2, 1])
-                with qf_c1:
-                    qf_act = st.selectbox(
-                        "Activity",
-                        [a for a in act_names if a != "."],
-                        key=f"qf_act_{week_start}_{di}",
-                    )
-                with qf_c2:
-                    qf_from_idx = TIME_SLOTS.index("9:00 AM") if "9:00 AM" in TIME_SLOTS else 0
-                    qf_from = st.selectbox(
-                        "From", TIME_SLOTS, index=qf_from_idx,
-                        key=f"qf_from_{week_start}_{di}",
-                    )
-                with qf_c3:
-                    qf_to_idx = TIME_SLOTS.index("5:00 PM") if "5:00 PM" in TIME_SLOTS else len(TIME_SLOTS) - 1
-                    qf_to = st.selectbox(
-                        "To", TIME_SLOTS, index=qf_to_idx,
-                        key=f"qf_to_{week_start}_{di}",
-                    )
-                with qf_c4:
-                    qf_agent = st.selectbox(
-                        "Agent",
-                        ["All agents"] + [a["name"] for a in agents_all],
-                        key=f"qf_agent_{week_start}_{di}",
-                    )
-                with qf_c5:
-                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-                    qf_go = st.button(
-                        "Apply", key=f"qf_apply_{week_start}_{di}",
-                        type="primary", use_container_width=True,
-                    )
-                st.markdown("</div>", unsafe_allow_html=True)
-
-                if qf_go:
-                    fi = TIME_SLOTS.index(qf_from)
-                    ti = TIME_SLOTS.index(qf_to)
-                    if fi > ti:
-                        st.error("'From' must be before 'To'.")
-                    else:
-                        targets = (
-                            [a["name"] for a in agents_all]
-                            if qf_agent == "All agents"
-                            else [qf_agent]
+                    if agents_all:
+                        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
+                        n_scheduled = sum(
+                            1 for ag_s in sched_data.values()
+                            if any(v not in (".", "") for v in ag_s.values())
                         )
-                        slots_to_fill = TIME_SLOTS[fi : ti + 1]
-                        for agent_name in targets:
-                            df_tmp = get_schedule_df(week_start, di, [agent_name])
-                            for slot in slots_to_fill:
-                                df_tmp.at[slot, agent_name] = qf_act
-                            save_schedule_df(week_start, di, df_tmp)
-                        st.toast(
-                            f"Set {qf_act} for {len(targets)} agent(s) · {len(slots_to_fill)} slots.",
-                            icon="✅",
-                        )
-                        st.rerun()
+                        chat_peak = max(
+                            (sum(1 for ag_s in sched_data.values()
+                                 if ag_s.get(s, ".") in _LIVE_CHAT) for s in TIME_SLOTS), default=0)
+                        phone_peak = max(
+                            (sum(1 for ag_s in sched_data.values()
+                                 if ag_s.get(s, ".") in _LIVE_PHONES) for s in TIME_SLOTS), default=0)
+                        st.markdown(
+                            f'<div style="display:flex;gap:16px;margin-bottom:8px;flex-wrap:wrap">'
+                            f'<span style="font-size:12px;color:#475569">👥 <b style="color:#0F172A">{len(agents_all)}</b> agents total</span>'
+                            f'<span style="font-size:12px;color:#475569">📋 <b style="color:#0F172A">{n_scheduled}</b> have shifts entered</span>'
+                            f'<span style="font-size:12px;color:#1D4ED8">💬 Peak Chat: <b>{chat_peak}</b></span>'
+                            f'<span style="font-size:12px;color:#065F46">📞 Peak Phones: <b>{phone_peak}</b></span>'
+                            f'</div>', unsafe_allow_html=True)
+                        cov_html = build_coverage_bar_html(sched_data, act_colors)
+                        if cov_html:
+                            st.markdown(cov_html, unsafe_allow_html=True)
+                        else:
+                            st.caption("No schedule data yet — use Edit to build this day's schedule.")
 
-                # ── Per-team grid editor ────────────────────────────────────────
-                for team in teams:
-                    team_agents = [a["name"] for a in agents_all if a["team_name"] == team["name"]]
-                    if not team_agents:
-                        continue
-                    clr = team_colors.get(team["name"], "#64748B")
+            # ── EDIT VIEW ─────────────────────────────────────────────────────
+            elif st.session_state[_view_key] == "edit" and can_edit():
+                if not _ordered_teams:
+                    st.info("Add agents in the Roster page first.")
+                else:
+                    # ── Team selector buttons ──────────────────────────────────
+                    _team_sel_key  = f"edit_team_{week_start}_{di}"
+                    _last_team_key = f"edit_last_team_{week_start}"   # persists across day tabs
+                    _edit_team_names = [t["name"] for t in _ordered_teams]
+                    if (_team_sel_key not in st.session_state or
+                            st.session_state[_team_sel_key] not in _edit_team_names):
+                        # Default to whichever team was last active on any tab this week
+                        _last = st.session_state.get(_last_team_key, _edit_team_names[0])
+                        st.session_state[_team_sel_key] = (
+                            _last if _last in _edit_team_names else _edit_team_names[0]
+                        )
+
+                    _sel_team_name = st.session_state[_team_sel_key]
+                    team_agents = [a["name"] for a in agents_all if a["team_name"] == _sel_team_name]
+
+                    # ── Team selector ──────────────────────────────────────────
+                    _tcols = st.columns(len(_edit_team_names))
+                    for _tc, _tn in zip(_tcols, _edit_team_names):
+                        with _tc:
+                            if st.button(
+                                _tn, key=f"tsel_{week_start}_{di}_{_tn}",
+                                type="primary" if st.session_state[_team_sel_key] == _tn else "secondary",
+                                use_container_width=True,
+                            ):
+                                st.session_state[_team_sel_key] = _tn
+                                st.session_state[_last_team_key] = _tn  # remember across tabs
+                                st.rerun()
+
+                    # ── Stats bar (from saved data) ────────────────────────────
+                    _ec_chat  = sum(1 for ag_s in sched_data.values() if any(v in _LIVE_CHAT   for v in ag_s.values()))
+                    _ec_phone = sum(1 for ag_s in sched_data.values() if any(v in _LIVE_PHONES for v in ag_s.values()))
+                    _chat_peak  = max((sum(1 for ag_s in sched_data.values() if ag_s.get(s, ".") in _LIVE_CHAT)   for s in TIME_SLOTS), default=0)
+                    _phone_peak = max((sum(1 for ag_s in sched_data.values() if ag_s.get(s, ".") in _LIVE_PHONES) for s in TIME_SLOTS), default=0)
                     st.markdown(
-                        f'<div style="background:{clr};color:white;padding:6px 12px;border-radius:8px;'
-                        f'font-weight:600;font-size:12px;margin:12px 0 6px">{team["name"]} Team '
-                        f'<span style="opacity:0.7;font-weight:400">— {len(team_agents)} agents</span></div>',
-                        unsafe_allow_html=True,
+                        f'<div style="display:flex;gap:16px;align-items:center;'
+                        f'background:#F0F5F3;border:1px solid #C4D9D2;border-radius:6px;'
+                        f'padding:8px 14px;margin-bottom:10px;flex-wrap:wrap">'
+                        f'<span style="font-size:11px;color:#475569">👥 <b style="color:#0F172A">{len(agents_all)}</b> agents</span>'
+                        f'<span style="font-size:11px;color:#1D4ED8">💬 Chat: <b>{_ec_chat}</b> &nbsp;·&nbsp; Peak: <b>{_chat_peak}</b></span>'
+                        f'<span style="font-size:11px;color:#065F46">📞 Phones: <b>{_ec_phone}</b> &nbsp;·&nbsp; Peak: <b>{_phone_peak}</b></span>'
+                        f'</div>', unsafe_allow_html=True)
+
+                    # ── Color legend ───────────────────────────────────────────
+                    _legend_chips = "".join(
+                        f'<span style="background:{act_colors.get(_an,("#E2E8F0","#475569"))[0]};'
+                        f'color:{act_colors.get(_an,("#E2E8F0","#475569"))[1]};'
+                        f'padding:2px 7px;border-radius:3px;font-size:10px;'
+                        f'font-weight:600;white-space:nowrap">{_an}</span>'
+                        for _an in act_names if _an != "."
                     )
-                    df = get_schedule_df(week_start, di, team_agents)
-                    col_cfg = {
-                        col: st.column_config.SelectboxColumn(
-                            label=col.split()[0], options=act_names, default=".", width="small"
+                    st.markdown(
+                        f'<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;'
+                        f'padding:6px 10px;background:#FAFAFA;border:1px solid #E2E8F0;border-radius:6px">'
+                        f'<span style="font-size:10px;color:#94A3B8;font-weight:700;'
+                        f'letter-spacing:0.08em;text-transform:uppercase;align-self:center;'
+                        f'margin-right:4px">KEY</span>{_legend_chips}</div>',
+                        unsafe_allow_html=True)
+
+                    # ── Dropdown color CSS ─────────────────────────────────────
+                    _dropdown_css = "<style>"
+                    for _an, (_abg, _afg) in act_colors.items():
+                        _esc = _an.replace('"', '\\"')
+                        _dropdown_css += (
+                            f'.ag-popup .ag-list-item[aria-label="{_esc}"]'
+                            f'{{background:{_abg}!important;color:{_afg}!important;font-weight:600!important}}'
+                            f'.ag-popup .ag-list-item[aria-label="{_esc}"]:hover'
+                            f'{{filter:brightness(0.93)!important}}'
                         )
-                        for col in df.columns
+                    _dropdown_css += "</style>"
+                    st.markdown(_dropdown_css, unsafe_allow_html=True)
+
+                    # ── Schedule editor (custom HTML component) ────────────────
+                    df = get_schedule_df(week_start, di, team_agents)
+                    _agent_cols = list(df.columns)
+
+                    _color_map = {
+                        k: {"bg": v[0], "fg": v[1]}
+                        for k, v in act_colors.items()
                     }
-                    edited = st.data_editor(
-                        df,
-                        column_config=col_cfg,
-                        use_container_width=True,
-                        key=f"edit_{week_start}_{di}_{team['name']}",
-                        height=min(420, 35 * len(TIME_SLOTS) + 38),
+                    # Neutral color for "." (empty slot)
+                    _color_map.setdefault(".", {"bg": "#F8FAFC", "fg": "#CBD5E1"})
+
+                    _result = _sched_editor(
+                        schedule_data=df.values.tolist(),
+                        agents=_agent_cols,
+                        time_slots=TIME_SLOTS,
+                        activities=act_names,
+                        color_map=_color_map,
+                        live_chat_acts=list(_LIVE_CHAT),
+                        live_phone_acts=list(_LIVE_PHONES),
+                        key=f"sched_ed_{week_start}_{di}_{_sel_team_name}",
+                        default=None,
                     )
-                    if st.button(
-                        f"💾 Save {team['name']}",
-                        key=f"save_{week_start}_{di}_{team['name']}",
-                        use_container_width=True,
-                        type="primary",
-                    ):
-                        save_schedule_df(week_start, di, edited)
-                        st.toast(f"Saved {team['name']} for {day_name}.", icon="✅")
+
+                    if _result and _result.get("saved"):
+                        _new_df = pd.DataFrame(
+                            _result["data"],
+                            index=TIME_SLOTS,
+                            columns=_agent_cols,
+                        )
+                        save_schedule_df(week_start, di, _new_df)
+                        _edit_date = datetime.date.fromisoformat(week_start) + datetime.timedelta(days=di)
+                        if _edit_date == datetime.date.today():
+                            st.session_state["_play_schedule_sound"] = True
+                        st.session_state[_view_key] = "edit"
+                        st.session_state[_team_sel_key] = _sel_team_name
+                        st.session_state[_last_team_key] = _sel_team_name  # persist across tabs
+                        st.toast(f"Saved {_sel_team_name} for {day_name}.", icon="✅")
+                        # Clear the component's stored value so _result resets to
+                        # None on the next render — without this, Streamlit keeps
+                        # returning {saved: True} from session state on every rerun,
+                        # causing an infinite save/rerun loop.
+                        _comp_ss_key = f"sched_ed_{week_start}_{di}_{_sel_team_name}"
+                        st.session_state.pop(_comp_ss_key, None)
                         st.rerun()
+
+
+
+# ─── PAGE: AGENT VIEW ────────────────────────────────────────────────────────
+
+_TZ_OPTIONS = {
+    "Eastern (ET)":   0,
+    "Central (CT)":  -1,
+    "Mountain (MT)": -2,
+    "Pacific (PT)":  -3,
+    "Alaska (AKT)":  -4,
+    "Hawaii (HST)":  -5,
+}
+_BASE_TZ_LABEL = "Eastern (ET)"   # app's stored schedule timezone
+
+def _make_tz_slot_label_map(offset_hours):
+    """Return {original_slot: display_label} with times shifted by offset_hours."""
+    if offset_hours == 0:
+        return {}
+    result = {}
+    for slot in TIME_SLOTS:
+        try:
+            base = datetime.datetime.strptime(slot, "%I:%M %p")
+            shifted = base + datetime.timedelta(hours=offset_hours)
+            result[slot] = shifted.strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            result[slot] = slot
+    return result
+
+def page_agent_view():
+    st.markdown('<div class="page-title">Agent View</div>', unsafe_allow_html=True)
+
+    user = current_user()
+    if not user:
+        st.warning("Please log in.")
+        return
+
+    today = datetime.date.today()
+    default_mon = today - datetime.timedelta(days=today.weekday())
+
+    if "av_sched_week" not in st.session_state:
+        st.session_state["av_sched_week"] = default_mon
+
+    # ── Controls row ──────────────────────────────────────────────────────────
+    hc1, hc2, hc3, hc4 = st.columns([2, 1, 1, 2])
+    with hc2:
+        if st.button("⬅ Prev", key="av_prev", use_container_width=True):
+            st.session_state["av_sched_week"] -= datetime.timedelta(weeks=1)
+            st.rerun()
+    with hc3:
+        if st.button("Next ➡", key="av_next", use_container_width=True):
+            st.session_state["av_sched_week"] += datetime.timedelta(weeks=1)
+            st.rerun()
+    with hc1:
+        sel = st.date_input(
+            "Week", value=st.session_state["av_sched_week"],
+            label_visibility="collapsed", key="av_week_input",
+        )
+        if sel.weekday() != 0:
+            sel = sel - datetime.timedelta(days=sel.weekday())
+        st.session_state["av_sched_week"] = sel
+    with hc4:
+        tz_label = st.selectbox(
+            "🌐 Timezone",
+            list(_TZ_OPTIONS.keys()),
+            index=0,
+            key="av_timezone",
+        )
+
+    tz_offset    = _TZ_OPTIONS[tz_label]
+    slot_lbl_map = _make_tz_slot_label_map(tz_offset)
+    week_start   = str(sel)
+
+    if tz_label != _BASE_TZ_LABEL:
+        sign = "+" if tz_offset >= 0 else ""
+        st.markdown(
+            f'<div style="font-size:11px;color:#64748B;margin-bottom:6px">'
+            f'Showing times in <b style="color:#0F172A">{tz_label}</b> '
+            f'({sign}{tz_offset}h from {_BASE_TZ_LABEL})</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f'<div style="font-size:13px;color:#64748B;margin-bottom:10px">'
+        f'Week of <b style="color:#0F172A">{sel.strftime("%B %-d, %Y")}</b></div>',
+        unsafe_allow_html=True,
+    )
+
+    agents_all  = get_agents()
+    teams       = get_teams()
+    team_colors = {t["name"]: t["color"] for t in teams}
+    act_colors  = get_act_colors()
+    agents_info = [
+        {"name": a["name"], "team_name": a["team_name"],
+         "color": team_colors.get(a["team_name"], "#64748B")}
+        for a in agents_all
+    ]
+
+    if not agents_all:
+        st.info("No agents on the roster yet.")
+        return
+
+    teams_with_agents = [t for t in teams
+                         if any(a["team_name"] == t["name"] for a in agents_info)]
+    _av_user = current_user()
+    _ordered_teams, _tl_order_key = resolve_team_order(_av_user, teams_with_agents)
+
+    n_rows = len(TIME_SLOTS) * 26 + 120
+
+    # ── Day tabs ──────────────────────────────────────────────────────────────
+    day_tabs = st.tabs([
+        f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
+        for i, d in enumerate(DAYS)
+    ])
+    _default_to_today_tab(week_start)
+    for di, dtab in enumerate(day_tabs):
+        with dtab:
+            # Load schedule for the day
+            day_sched = {}
+            for ag in agents_all:
+                df = get_schedule_df(week_start, di, [ag["name"]])
+                day_sched[ag["name"]] = df[ag["name"]].to_dict()
+
+            for _i, team in enumerate(_ordered_teams):
+                team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
+                if not team_agents:
+                    continue
+
+                _hcol, _ucol, _dcol = st.columns([30, 1, 1])
+                with _hcol:
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">'
+                        f'<div style="width:10px;height:10px;border-radius:50%;background:{team["color"]}"></div>'
+                        f'<span style="font-size:13px;font-weight:600;color:#1E293B">{team["name"]} Team</span>'
+                        f'<span style="font-size:11px;color:#94A3B8">— {len(team_agents)} agents</span>'
+                        f'</div>', unsafe_allow_html=True
+                    )
+                with _ucol:
+                    if st.button("↑", key=f"av_up_{di}_{team['name']}",
+                                 disabled=(_i == 0), help="Move up"):
+                        _ord = st.session_state[_tl_order_key]
+                        _idx = _ord.index(team["name"])
+                        _ord[_idx], _ord[_idx-1] = _ord[_idx-1], _ord[_idx]
+                        save_user_team_order(_av_user["id"], _ord)
+                        st.rerun()
+                with _dcol:
+                    if st.button("↓", key=f"av_dn_{di}_{team['name']}",
+                                 disabled=(_i == len(_ordered_teams)-1), help="Move down"):
+                        _ord = st.session_state[_tl_order_key]
+                        _idx = _ord.index(team["name"])
+                        _ord[_idx], _ord[_idx+1] = _ord[_idx+1], _ord[_idx]
+                        save_user_team_order(_av_user["id"], _ord)
+                        st.rerun()
+                team_sched = {a["name"]: day_sched.get(a["name"], {}) for a in team_agents}
+                st_components.html(
+                    build_timeline_html(team_agents, team_sched, act_colors,
+                                        slot_label_map=slot_lbl_map),
+                    height=n_rows, scrolling=False,
+                )
 
 
 # ─── PAGE: TIME OFF ───────────────────────────────────────────────────────────
 
 def page_timeoff():
     st.markdown('<div class="page-title">Time Off</div>', unsafe_allow_html=True)
+
+    # Play submission chime if flagged by previous rerun
+    if st.session_state.pop("_play_timeoff_sound", False):
+        st_components.html("""
+        <script>
+        (function() {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            [[523.25, 0.00], [659.25, 0.15], [783.99, 0.30]].forEach(([freq, t]) => {
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.type = 'sine'; osc.frequency.value = freq;
+                gain.gain.setValueAtTime(0.25, ctx.currentTime + t);
+                gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + t + 0.35);
+                osc.start(ctx.currentTime + t);
+                osc.stop(ctx.currentTime + t + 0.35);
+            });
+        })();
+        </script>
+        """, height=0)
 
     # ── Viewer-only mode ───────────────────────────────────────────────────────
     if not can_edit():
@@ -1725,22 +3959,91 @@ def page_timeoff():
                     </div>""", unsafe_allow_html=True)
 
         with tab_submit:
-            agents_list = get_agent_names()
-            default_idx = agents_list.index(my_name) if my_name in agents_list else 0
-            with st.form("submit_to_viewer"):
-                agent = st.selectbox("Your name", agents_list, index=default_idx)
-                c1, c2 = st.columns(2)
-                with c1: start = st.date_input("Start date", value=datetime.date.today()+datetime.timedelta(7))
-                with c2: end   = st.date_input("End date",   value=datetime.date.today()+datetime.timedelta(7))
-                rtype = st.selectbox("Type", TIMEOFF_TYPES)
-                notes = st.text_input("Notes (optional)")
-                if st.form_submit_button("Submit request", type="primary"):
-                    if end < start:
-                        st.error("End date must be on or after start date.")
+            st.markdown(f'<div style="font-size:13px;color:#475569;margin-bottom:8px">Submitting as <strong>{my_name}</strong></div>', unsafe_allow_html=True)
+            _slot_opts = ["(select a time)"] + TIME_SLOTS
+            _vtype = st.selectbox("Type", TIMEOFF_TYPES, key="viewer_rtype")
+
+            if _vtype == "Shift Swap":
+                st.markdown('<div style="font-size:12px;color:#64748B;margin:4px 0 8px">Fill in both the shift you\'re giving up and the shift you\'re taking on.</div>', unsafe_allow_html=True)
+                st.markdown("**Shift to give up**")
+                sf1, sf2, sf3 = st.columns(3)
+                with sf1: _from_date = st.date_input("Date", value=datetime.date.today()+datetime.timedelta(7), key="v_from_date")
+                with sf2: _from_start = st.selectbox("Start time", _slot_opts, key="v_from_start")
+                with sf3: _from_end   = st.selectbox("End time",   _slot_opts, key="v_from_end")
+                st.markdown("**Moving to**")
+                st1, st2, st3 = st.columns(3)
+                with st1: _to_date  = st.date_input("Date", value=datetime.date.today()+datetime.timedelta(8), key="v_to_date")
+                with st2: _to_start = st.selectbox("Start time", _slot_opts, key="v_to_start")
+                with st3: _to_end   = st.selectbox("End time",   _slot_opts, key="v_to_end")
+                _vnotes = st.text_input("Notes *", key="v_swap_notes")
+                if st.button("Submit request", type="primary", key="v_swap_submit"):
+                    _errs = []
+                    if not my_name: _errs.append("Could not identify your account.")
+                    if not _vnotes.strip(): _errs.append("Notes are required.")
+                    if _from_start == "(select a time)" or _from_end == "(select a time)": _errs.append("Select start and end times for the shift you're giving up.")
+                    if _to_start == "(select a time)" or _to_end == "(select a time)": _errs.append("Select start and end times for the shift you're taking on.")
+                    if _errs:
+                        for _e in _errs: st.error(_e)
                     else:
-                        ag_data = next((a for a in get_agents() if a["name"]==agent), {})
-                        add_time_off_request(agent, ag_data.get("team_name",""), start, end, rtype, notes)
-                        st.success("Request submitted — your manager will review it soon.")
+                        ag_data = next((a for a in get_agents() if a["name"]==my_name), {})
+                        add_time_off_request(my_name, ag_data.get("team_name",""),
+                                             _to_date, _to_date, "Shift Swap", _vnotes,
+                                             _to_start, _to_end,
+                                             str(_from_date), _from_start, _from_end)
+                        st.session_state["_play_timeoff_sound"] = True
+                        st.toast("Shift swap request submitted — your manager will review it soon.", icon="✅")
+                        st.rerun()
+            else:
+                _KRONOS_TYPES = {"PTO", "Sick", "Bereavement"}
+                _needs_kronos = _vtype in _KRONOS_TYPES
+                with st.form("submit_to_viewer"):
+                    c1, c2 = st.columns(2)
+                    with c1: start = st.date_input("Start date", value=datetime.date.today()+datetime.timedelta(7))
+                    with c2: end   = st.date_input("End date",   value=datetime.date.today()+datetime.timedelta(7))
+                    st.markdown('<div style="font-size:11px;color:#64748B;margin:2px 0 4px">Time range — leave blank to apply to the full day</div>', unsafe_allow_html=True)
+                    _vt1, _vt2 = st.columns(2)
+                    _v_slot_opts = ["(all day)"] + TIME_SLOTS
+                    with _vt1: _v_st_sel = st.selectbox("Start time (ET)", _v_slot_opts, key="v_st_time")
+                    with _vt2: _v_en_sel = st.selectbox("End time (ET)",   _v_slot_opts, key="v_en_time")
+                    notes = st.text_input("Notes *")
+                    _kronos_ok = True
+                    if _needs_kronos:
+                        st.markdown("""
+                        <div style="background:#FEF3C7;border:1px solid #F59E0B;border-radius:6px;
+                                    padding:10px 14px;margin:10px 0 4px">
+                            <div style="font-size:12px;font-weight:700;color:#92400E">⚠️ Kronos submission required</div>
+                            <div style="font-size:11px;color:#78350F;margin-top:3px">
+                                This type of request must also be submitted in Kronos.
+                                Please do that first, then confirm below.
+                            </div>
+                        </div>""", unsafe_allow_html=True)
+                        _kronos_ok = st.checkbox("I have submitted this request in Kronos ✓")
+                    if st.form_submit_button("Submit request", type="primary"):
+                        if not my_name:
+                            st.error("Could not identify your account. Please log out and back in.")
+                        elif not notes.strip():
+                            st.error("Notes are required.")
+                        elif end < start:
+                            st.error("End date must be on or after start date.")
+                        elif _needs_kronos and not _kronos_ok:
+                            st.error("Please confirm you have submitted this request in Kronos before continuing.")
+                        else:
+                            _v_st_time = "" if _v_st_sel == "(all day)" else _v_st_sel
+                            _v_en_time = "" if _v_en_sel == "(all day)" else _v_en_sel
+                            if _v_st_time and _v_en_time and TIME_SLOTS.index(_v_st_time) > TIME_SLOTS.index(_v_en_time):
+                                st.error("Start time must be before end time.")
+                            else:
+                                ag_data = next((a for a in get_agents() if a["name"]==my_name), {})
+                                add_time_off_request(my_name, ag_data.get("team_name",""), start, end, _vtype, notes, _v_st_time, _v_en_time)
+                                if get_setting("slack_notify_submissions", "") == "yes":
+                                    send_slack_message(
+                                        f"📋 *New time-off request* — {my_name} ({ag_data.get('team_name','')}) "
+                                        f"submitted a *{_vtype}* request from {start} to {end}."
+                                        + (f"\n> {notes}" if notes else "")
+                                    )
+                                st.session_state["_play_timeoff_sound"] = True
+                                st.toast("Request submitted — your manager will review it soon.", icon="✅")
+                                st.rerun()
         return
     # ── Admin / Editor mode ────────────────────────────────────────────────────
 
@@ -1791,6 +4094,7 @@ def page_timeoff():
                 <div style="font-size:13px;color:#475569">
                     <b>{req["type"]}</b> &nbsp;·&nbsp; {s.strftime("%b %-d")} – {e.strftime("%b %-d, %Y")}
                     &nbsp;·&nbsp; {days} day{"s" if days!=1 else ""}
+                    {f"&nbsp;·&nbsp; <b>{req['start_time']} – {req['end_time']}</b>" if req.get("start_time") and req.get("end_time") else "&nbsp;·&nbsp; all day"}
                     {"&nbsp;·&nbsp; <i>"+req['notes']+"</i>" if req["notes"] else ""}
                 </div>
             </div>""", unsafe_allow_html=True)
@@ -1798,12 +4102,28 @@ def page_timeoff():
             ca, cb, _ = st.columns([1, 1, 5])
             with ca:
                 if st.button("✅ Approve", key=f"ap_{req['id']}", use_container_width=True, type="primary"):
-                    update_request_status(req["id"], "Approved", "Scott M.")
+                    u = current_user()
+                    approver = u["display_name"] if u else "Admin"
+                    update_request_status(req["id"], "Approved", approver)
+                    add_notification(req["agent_name"],
+                        f"✅ Your {req['type']} request ({req['start_date']} – {req['end_date']}) was approved by {approver}.")
+                    send_slack_message(
+                        f"✅ *Time-off approved* — {req['agent_name']}'s {req['type']} "
+                        f"({req['start_date']} – {req['end_date']}) approved by {approver}."
+                    )
                     st.toast(f"Approved {req['agent_name']}'s request.", icon="✅")
                     st.rerun()
             with cb:
                 if st.button("✗ Deny", key=f"dn_{req['id']}", use_container_width=True):
-                    update_request_status(req["id"], "Denied")
+                    u = current_user()
+                    approver = u["display_name"] if u else "Admin"
+                    update_request_status(req["id"], "Denied", approver)
+                    add_notification(req["agent_name"],
+                        f"🚫 Your {req['type']} request ({req['start_date']} – {req['end_date']}) was denied.")
+                    send_slack_message(
+                        f"🚫 *Time-off denied* — {req['agent_name']}'s {req['type']} "
+                        f"({req['start_date']} – {req['end_date']}) denied by {approver}."
+                    )
                     st.toast("Request denied.", icon="🚫")
                     st.rerun()
 
@@ -1824,7 +4144,7 @@ def page_timeoff():
                     </div>
                     <div style="flex:1">
                         <span style="font-size:13px;font-weight:600;color:#0F172A">{req["agent_name"]}</span>
-                        <span style="font-size:12px;color:#94A3B8;margin-left:8px">{req["type"]} · {s.strftime("%-m/%-d")}–{e.strftime("%-m/%-d")} · {days}d</span>
+                        <span style="font-size:12px;color:#94A3B8;margin-left:8px">{req["type"]} · {s.strftime("%-m/%-d")}–{e.strftime("%-m/%-d")} · {days}d{f" · {req['start_time']}–{req['end_time']}" if req.get("start_time") and req.get("end_time") else " · all day"}</span>
                     </div>
                     {status_pill(req["status"])}
                 </div>""", unsafe_allow_html=True)
@@ -1834,20 +4154,87 @@ def page_timeoff():
         if not agents_list:
             st.warning("Add agents to the Roster first.")
         else:
-            with st.form("submit_to"):
-                agent = st.selectbox("Agent", agents_list)
-                c1, c2 = st.columns(2)
-                with c1: start = st.date_input("Start date", value=datetime.date.today()+datetime.timedelta(7))
-                with c2: end   = st.date_input("End date",   value=datetime.date.today()+datetime.timedelta(7))
-                rtype = st.selectbox("Type", TIMEOFF_TYPES)
-                notes = st.text_input("Notes (optional)")
-                if st.form_submit_button("Submit request", type="primary"):
-                    if end < start:
-                        st.error("End date must be on or after start date.")
+            _slot_opts = ["(all day)"] + TIME_SLOTS
+            _swap_opts = ["(select a time)"] + TIME_SLOTS
+            _admin_rtype = st.selectbox("Type", TIMEOFF_TYPES, key="admin_rtype")
+
+            if _admin_rtype == "Shift Swap":
+                agent = st.selectbox("Agent", agents_list, key="admin_swap_agent")
+                st.markdown('<div style="font-size:12px;color:#64748B;margin:4px 0 8px">Fill in both the shift being given up and the shift being taken on.</div>', unsafe_allow_html=True)
+                st.markdown("**Shift to give up**")
+                af1, af2, af3 = st.columns(3)
+                with af1: _a_from_date  = st.date_input("Date", value=datetime.date.today()+datetime.timedelta(7), key="a_from_date")
+                with af2: _a_from_start = st.selectbox("Start time", _swap_opts, key="a_from_start")
+                with af3: _a_from_end   = st.selectbox("End time",   _swap_opts, key="a_from_end")
+                st.markdown("**Moving to**")
+                at1, at2, at3 = st.columns(3)
+                with at1: _a_to_date  = st.date_input("Date", value=datetime.date.today()+datetime.timedelta(8), key="a_to_date")
+                with at2: _a_to_start = st.selectbox("Start time", _swap_opts, key="a_to_start")
+                with at3: _a_to_end   = st.selectbox("End time",   _swap_opts, key="a_to_end")
+                _a_notes = st.text_input("Notes *", key="a_swap_notes")
+                if st.button("Submit shift swap", type="primary", key="a_swap_submit"):
+                    _errs = []
+                    if not _a_notes.strip(): _errs.append("Notes are required.")
+                    if _a_from_start == "(select a time)" or _a_from_end == "(select a time)": _errs.append("Select times for the shift being given up.")
+                    if _a_to_start == "(select a time)" or _a_to_end == "(select a time)": _errs.append("Select times for the shift being taken on.")
+                    if _errs:
+                        for _e in _errs: st.error(_e)
                     else:
                         ag_data = next((a for a in get_agents() if a["name"]==agent), {})
-                        add_time_off_request(agent, ag_data.get("team_name",""), start, end, rtype, notes)
-                        st.success(f"Request submitted for {agent}.")
+                        add_time_off_request(agent, ag_data.get("team_name",""),
+                                             _a_to_date, _a_to_date, "Shift Swap", _a_notes,
+                                             _a_to_start, _a_to_end,
+                                             str(_a_from_date), _a_from_start, _a_from_end)
+                        st.toast(f"Shift swap submitted for {agent}.", icon="✅")
+                        st.rerun()
+            else:
+                _KRONOS_TYPES = {"PTO", "Sick", "Bereavement"}
+                _needs_kronos = _admin_rtype in _KRONOS_TYPES
+                with st.form("submit_to"):
+                    agent = st.selectbox("Agent", agents_list)
+                    c1, c2 = st.columns(2)
+                    with c1: start = st.date_input("Start date", value=datetime.date.today()+datetime.timedelta(7))
+                    with c2: end   = st.date_input("End date",   value=datetime.date.today()+datetime.timedelta(7))
+                    st.markdown('<div style="font-size:11px;color:#64748B;margin:2px 0 4px">Time range — leave blank to apply to the full day</div>', unsafe_allow_html=True)
+                    tc1, tc2 = st.columns(2)
+                    with tc1: _st_sel = st.selectbox("Start time (ET)", _slot_opts, key="to_st_time")
+                    with tc2: _en_sel = st.selectbox("End time (ET)",   _slot_opts, key="to_en_time")
+                    notes = st.text_input("Notes *")
+                    _kronos_ok = True
+                    if _needs_kronos:
+                        st.markdown("""
+                        <div style="background:#FEF3C7;border:1px solid #F59E0B;border-radius:6px;
+                                    padding:10px 14px;margin:10px 0 4px">
+                            <div style="font-size:12px;font-weight:700;color:#92400E">⚠️ Kronos submission required</div>
+                            <div style="font-size:11px;color:#78350F;margin-top:3px">
+                                This type of request must also be submitted in Kronos.
+                                Please confirm it has been submitted before proceeding.
+                            </div>
+                        </div>""", unsafe_allow_html=True)
+                        _kronos_ok = st.checkbox("Submitted in Kronos ✓")
+                    if st.form_submit_button("Submit request", type="primary"):
+                        if not notes.strip():
+                            st.error("Notes are required.")
+                        elif end < start:
+                            st.error("End date must be on or after start date.")
+                        elif _needs_kronos and not _kronos_ok:
+                            st.error("Please confirm the Kronos submission is complete before continuing.")
+                        else:
+                            _st_time = "" if _st_sel == "(all day)" else _st_sel
+                            _en_time = "" if _en_sel == "(all day)" else _en_sel
+                            if _st_time and _en_time and TIME_SLOTS.index(_st_time) > TIME_SLOTS.index(_en_time):
+                                st.error("Start time must be before end time.")
+                            else:
+                                ag_data = next((a for a in get_agents() if a["name"]==agent), {})
+                                add_time_off_request(agent, ag_data.get("team_name",""), start, end, _admin_rtype, notes, _st_time, _en_time)
+                                if get_setting("slack_notify_submissions", "") == "yes":
+                                    send_slack_message(
+                                        f"📋 *New time-off request* — {agent} ({ag_data.get('team_name','')}) "
+                                        f"submitted a *{_admin_rtype}* request from {start} to {end}."
+                                        + (f"\n> {notes}" if notes else "")
+                                    )
+                                st.toast(f"Request submitted for {agent}.", icon="✅")
+                                st.rerun()
 
 
 # ─── PAGE: ROSTER ─────────────────────────────────────────────────────────────
@@ -1924,11 +4311,36 @@ def page_roster():
                                                  index=0 if ag["employment_type"]=="FT" else 1)
                             h = st.number_input("Hours", 1, 40, int(ag["weekly_hours"]))
                             wd = st.text_input("Work days", ag["work_days"])
+                            # Per-agent default activity override
+                            act_opts = ["(use team default)"] + get_activity_names()
+                            ag_def = ag.get("default_activity", "") or "(use team default)"
+                            ag_def_idx = act_opts.index(ag_def) if ag_def in act_opts else 0
+                            ag_default_act = st.selectbox(
+                                "Default activity (overrides team)",
+                                act_opts, index=ag_def_idx,
+                                help="Leave as 'use team default' unless this agent needs a different base activity."
+                            )
                             nt = st.text_input("Notes", ag.get("notes",""))
+                            slack_id_input = st.text_input(
+                                "Slack Member ID",
+                                value=ag.get("slack_user_id") or "",
+                                placeholder="U0A1B2C3D",
+                                help="In Slack: click the agent's profile → ⋯ → Copy member ID. Used to send them DMs when their today's schedule changes."
+                            )
                             cs, cd = st.columns(2)
                             with cs:
                                 if st.form_submit_button("Save", use_container_width=True):
                                     ok, msg = upsert_agent(n, t_sel, e_sel, h, wd, nt, ag["id"])
+                                    if ok:
+                                        # Save default activity override + Slack ID
+                                        conn2 = get_conn()
+                                        conn2.execute(
+                                            "UPDATE agents SET default_activity=?, slack_user_id=? WHERE id=?",
+                                            ("" if ag_default_act == "(use team default)" else ag_default_act,
+                                             slack_id_input.strip() or None,
+                                             ag["id"])
+                                        )
+                                        conn2.commit(); conn2.close()
                                     st.toast(msg, icon="✅" if ok else "❌")
                                     if ok: st.rerun()
                             with cd:
@@ -1936,6 +4348,140 @@ def page_roster():
                                     delete_agent(ag["id"])
                                     st.toast(f"Removed {ag['name']}.", icon="🗑️")
                                     st.rerun()
+
+                        # ── Shift hours editor — one Save button for all days ──
+                        st.markdown(
+                            '<div style="font-size:10px;font-weight:700;color:#689985;'
+                            'text-transform:uppercase;letter-spacing:0.1em;margin:10px 0 4px;'
+                            'font-family:\'DM Sans\',sans-serif">Shift hours</div>',
+                            unsafe_allow_html=True
+                        )
+                        wh = get_agent_work_hours(ag["name"])
+                        # Render each day row — checkbox + start + end + split toggle
+                        for di, day in enumerate(DAYS):
+                            cfg = wh.get(di, {"start_slot": "9:00 AM", "end_slot": "5:00 PM",
+                                              "is_active": False, "split_start_slot": None, "split_end_slot": None})
+                            _day_active = st.session_state.get(f"wh_act_{ag['id']}_{di}", cfg["is_active"])
+                            dc1, dc2, dc3, dc4 = st.columns([1.0, 2.0, 2.0, 1.5])
+                            with dc1:
+                                st.checkbox(day[:3], value=cfg["is_active"],
+                                            key=f"wh_act_{ag['id']}_{di}")
+                            with dc2:
+                                si = TIME_SLOTS.index(cfg["start_slot"]) if cfg["start_slot"] in TIME_SLOTS else TIME_SLOTS.index("9:00 AM")
+                                st.selectbox("Start", TIME_SLOTS, index=si,
+                                             key=f"wh_start_{ag['id']}_{di}",
+                                             label_visibility="collapsed",
+                                             disabled=not _day_active)
+                            with dc3:
+                                ei = TIME_SLOTS.index(cfg["end_slot"]) if cfg["end_slot"] in TIME_SLOTS else TIME_SLOTS.index("5:00 PM")
+                                st.selectbox("End", TIME_SLOTS, index=ei,
+                                             key=f"wh_end_{ag['id']}_{di}",
+                                             label_visibility="collapsed",
+                                             disabled=not _day_active)
+                            with dc4:
+                                _has_split = cfg.get("split_start_slot") is not None
+                                st.checkbox("Split", value=_has_split,
+                                            key=f"wh_split_{ag['id']}_{di}",
+                                            disabled=not _day_active,
+                                            help="Agent works a second shift segment on this day")
+                            # Split segment row (visible when split is checked and day is active)
+                            _split_on = st.session_state.get(f"wh_split_{ag['id']}_{di}", _has_split)
+                            if _split_on and _day_active:
+                                _, ds1, ds2 = st.columns([1.0, 2.0, 2.0])
+                                _saved_sp_start = cfg.get("split_start_slot") or "1:00 PM"
+                                _saved_sp_end   = cfg.get("split_end_slot")   or "5:00 PM"
+                                with ds1:
+                                    _ssi = TIME_SLOTS.index(_saved_sp_start) if _saved_sp_start in TIME_SLOTS else TIME_SLOTS.index("1:00 PM")
+                                    st.selectbox("Split start", TIME_SLOTS, index=_ssi,
+                                                 key=f"wh_split_start_{ag['id']}_{di}",
+                                                 label_visibility="collapsed")
+                                with ds2:
+                                    _sei = TIME_SLOTS.index(_saved_sp_end) if _saved_sp_end in TIME_SLOTS else TIME_SLOTS.index("5:00 PM")
+                                    st.selectbox("Split end", TIME_SLOTS, index=_sei,
+                                                 key=f"wh_split_end_{ag['id']}_{di}",
+                                                 label_visibility="collapsed")
+                        # Single save button for all days
+                        if st.button("Save shift hours", key=f"wh_save_all_{ag['id']}",
+                                     use_container_width=True):
+                            for di in range(len(DAYS)):
+                                active_val  = st.session_state.get(f"wh_act_{ag['id']}_{di}", False)
+                                start_val   = st.session_state.get(f"wh_start_{ag['id']}_{di}", "9:00 AM")
+                                end_val     = st.session_state.get(f"wh_end_{ag['id']}_{di}",   "5:00 PM")
+                                split_on    = st.session_state.get(f"wh_split_{ag['id']}_{di}", False)
+                                split_start = st.session_state.get(f"wh_split_start_{ag['id']}_{di}", None) if split_on else None
+                                split_end   = st.session_state.get(f"wh_split_end_{ag['id']}_{di}",   None) if split_on else None
+                                save_agent_work_hours(ag["name"], di, start_val, end_val, active_val,
+                                                      split_start, split_end)
+                            st.toast("Shift hours saved.", icon="✅")
+
+                        # ── Lunch slot ─────────────────────────────────────────
+                        st.markdown(
+                            '<div style="font-size:10px;font-weight:700;color:#689985;'
+                            'text-transform:uppercase;letter-spacing:0.1em;margin:10px 0 4px;'
+                            'font-family:\'DM Sans\',sans-serif">Lunch</div>',
+                            unsafe_allow_html=True
+                        )
+                        _ag_rules_all, _ = get_coverage_rules()
+                        _ag_lunch = _ag_rules_all.get(ag["name"], {})
+                        _lunch_opts = ["None"] + TIME_SLOTS
+                        _cur_slot = _ag_lunch.get("lunch_slot") or "None"
+                        if _cur_slot not in _lunch_opts:
+                            _cur_slot = "None"
+                        _cur_dur = int(_ag_lunch.get("lunch_duration", 1))
+                        _lc1, _lc2 = st.columns([3, 2])
+                        with _lc1:
+                            _new_slot = st.selectbox(
+                                "Lunch start", _lunch_opts,
+                                index=_lunch_opts.index(_cur_slot),
+                                key=f"lunch_slot_{ag['id']}",
+                                label_visibility="collapsed",
+                            )
+                        with _lc2:
+                            _DUR_OPTS = [1, 2, 3, 4]
+                            _DUR_LABELS = {1: "30 min", 2: "1 hr", 3: "1.5 hrs", 4: "2 hrs"}
+                            _new_dur = st.selectbox(
+                                "Duration", _DUR_OPTS,
+                                index=_DUR_OPTS.index(_cur_dur) if _cur_dur in _DUR_OPTS else 0,
+                                key=f"lunch_dur_{ag['id']}",
+                                label_visibility="collapsed",
+                                format_func=lambda x: _DUR_LABELS[x],
+                            )
+                        if st.button("Save lunch", key=f"lunch_save_{ag['id']}",
+                                     use_container_width=True):
+                            save_agent_lunch(
+                                ag["name"],
+                                None if _new_slot == "None" else _new_slot,
+                                _new_dur,
+                            )
+                            st.toast("Lunch settings saved.", icon="✅")
+
+                        # ── Linked login account ────────────────────────────────
+                        st.markdown(
+                            '<div style="font-size:10px;font-weight:700;color:#689985;'
+                            'text-transform:uppercase;letter-spacing:0.1em;margin:10px 0 4px;'
+                            'font-family:\'DM Sans\',sans-serif">Linked account</div>',
+                            unsafe_allow_html=True
+                        )
+                        _all_users   = list_users()
+                        _user_opts   = ["(none)"] + [f"{u['display_name']} ({u['username']})" for u in _all_users]
+                        _user_ids    = [None] + [u["id"] for u in _all_users]
+                        _cur_link    = ag.get("linked_user_id")
+                        _link_idx    = _user_ids.index(_cur_link) if _cur_link in _user_ids else 0
+                        _new_link_lbl = st.selectbox(
+                            "Login account", _user_opts,
+                            index=_link_idx,
+                            key=f"linked_user_{ag['id']}",
+                            label_visibility="collapsed",
+                            help="Connect this roster profile to a login account so the agent sees their own schedule when they log in.",
+                        )
+                        _new_link_id = _user_ids[_user_opts.index(_new_link_lbl)]
+                        if st.button("Save account link", key=f"link_save_{ag['id']}",
+                                     use_container_width=True):
+                            _lc = get_conn()
+                            _lc.execute("UPDATE agents SET linked_user_id=? WHERE id=?",
+                                        (_new_link_id, ag["id"]))
+                            _lc.commit(); _lc.close()
+                            st.toast("Account link saved.", icon="✅")
 
         # Unassigned agents
         known_teams = set(team_names)
@@ -1982,10 +4528,25 @@ def page_teams():
                         tn = st.text_input("Team name", team["name"])
                         tc = st.color_picker("Color", team["color"])
                         td = st.text_input("Description", team.get("description", ""))
+                        # Default activity for base schedule generation
+                        act_options = ["(none)"] + get_activity_names()
+                        cur_default = team.get("default_activity", "") or "(none)"
+                        def_idx = act_options.index(cur_default) if cur_default in act_options else 0
+                        t_default_act = st.selectbox(
+                            "Default activity (base schedule)",
+                            act_options,
+                            index=def_idx,
+                            help="When generating a base schedule, agents on this team will be filled with this activity during their configured shift hours."
+                        )
                         cs, cd = st.columns(2)
                         with cs:
                             if st.form_submit_button("Save", use_container_width=True):
                                 ok, msg = upsert_team(tn, tc, td, team["id"])
+                                if ok:
+                                    set_team_default_activity(
+                                        tn,
+                                        "" if t_default_act == "(none)" else t_default_act
+                                    )
                                 st.toast(msg, icon="✅" if ok else "❌")
                                 if ok: st.rerun()
                         with cd:
@@ -2107,21 +4668,10 @@ def _template_editor(template_id):
                          "color": team_colors.get(a["team_name"], "#64748B")}
                         for a in agents_all
                     ]
-                    # Reuse the same team order from session state (shared with schedule view)
-                    _tl_order_key = "timeline_team_order"
                     teams_with_agents = [t for t in teams
                                          if any(a["team_name"] == t["name"] for a in agents_info)]
-                    if _tl_order_key not in st.session_state:
-                        st.session_state[_tl_order_key] = [t["name"] for t in teams_with_agents]
-                    else:
-                        _cur   = {t["name"] for t in teams_with_agents}
-                        _saved = [n for n in st.session_state[_tl_order_key] if n in _cur]
-                        _new   = [t["name"] for t in teams_with_agents if t["name"] not in set(_saved)]
-                        st.session_state[_tl_order_key] = _saved + _new
-
-                    _team_lookup   = {t["name"]: t for t in teams}
-                    _ordered_teams = [_team_lookup[n] for n in st.session_state[_tl_order_key]
-                                      if n in _team_lookup]
+                    _tmpl_user = current_user()
+                    _ordered_teams, _tl_order_key = resolve_team_order(_tmpl_user, teams_with_agents)
                     n_rows = len(TIME_SLOTS) * 26 + 60
 
                     for _i, team in enumerate(_ordered_teams):
@@ -2161,53 +4711,6 @@ def _template_editor(template_id):
                         st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
             with edit_tab:
-                # ── Quick Fill ────────────────────────────────────────────────
-                st.markdown(
-                    '<div style="background:#F0F5F3;border:1px solid #C4D9D2;border-radius:4px;'
-                    'padding:12px 16px;margin-bottom:14px">'
-                    '<div style="font-size:10px;font-weight:700;color:#689985;margin-bottom:10px;'
-                    'letter-spacing:0.12em;text-transform:uppercase;font-family:\'DM Sans\',sans-serif">'
-                    'Quick Fill — set one activity across multiple slots and agents</div>',
-                    unsafe_allow_html=True,
-                )
-                qc1, qc2, qc3, qc4, qc5 = st.columns([2, 2, 2, 2, 1])
-                with qc1:
-                    tqf_act = st.selectbox("Activity", [a for a in act_names if a != "."],
-                                           key=f"tqf_act_{template_id}_{di}")
-                with qc2:
-                    fi_idx = TIME_SLOTS.index("9:00 AM") if "9:00 AM" in TIME_SLOTS else 0
-                    tqf_from = st.selectbox("From", TIME_SLOTS, index=fi_idx,
-                                            key=f"tqf_from_{template_id}_{di}")
-                with qc3:
-                    ti_idx = TIME_SLOTS.index("5:00 PM") if "5:00 PM" in TIME_SLOTS else len(TIME_SLOTS)-1
-                    tqf_to = st.selectbox("To", TIME_SLOTS, index=ti_idx,
-                                          key=f"tqf_to_{template_id}_{di}")
-                with qc4:
-                    tqf_agent = st.selectbox("Agent",
-                                             ["All agents"] + [a["name"] for a in agents_all],
-                                             key=f"tqf_agent_{template_id}_{di}")
-                with qc5:
-                    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-                    tqf_go = st.button("Apply", key=f"tqf_apply_{template_id}_{di}",
-                                       type="primary", use_container_width=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-
-                if tqf_go:
-                    fi = TIME_SLOTS.index(tqf_from)
-                    ti = TIME_SLOTS.index(tqf_to)
-                    if fi > ti:
-                        st.error("'From' must be before 'To'.")
-                    else:
-                        tgts = ([a["name"] for a in agents_all] if tqf_agent == "All agents"
-                                else [tqf_agent])
-                        for aname in tgts:
-                            df_tmp = get_template_df(template_id, di, [aname])
-                            for slot in TIME_SLOTS[fi:ti+1]:
-                                df_tmp.at[slot, aname] = tqf_act
-                            save_template_df(template_id, di, df_tmp)
-                        st.toast(f"Set {tqf_act} for {len(tgts)} agent(s).", icon="✅")
-                        st.rerun()
-
                 # ── Per-team grids ────────────────────────────────────────────
                 for team in teams:
                     team_agents = [a["name"] for a in agents_all
@@ -2223,21 +4726,32 @@ def _template_editor(template_id):
                         unsafe_allow_html=True,
                     )
                     df = get_template_df(template_id, di, team_agents)
+                    _tmpl_agent_cols = list(df.columns)
+                    df[" "] = ""  # spacer so scrollbar doesn't overlap last agent
                     col_cfg = {
                         col: st.column_config.SelectboxColumn(
                             label=col.split()[0], options=act_names, default=".", width="small"
                         )
-                        for col in df.columns
+                        for col in _tmpl_agent_cols
                     }
-                    edited = st.data_editor(
-                        df, column_config=col_cfg, use_container_width=True,
-                        key=f"tmpl_edit_{template_id}_{di}_{team['name']}",
-                        height=min(420, 35 * len(TIME_SLOTS) + 38),
-                    )
+                    col_cfg[" "] = st.column_config.TextColumn(" ", disabled=True, width="small")
+                    def _cell_style_t(val):
+                        if val == "." or not val or val not in act_colors:
+                            return "color:#CBD5E1"
+                        bg, _ = act_colors[val]
+                        return f"color:{bg};font-weight:700"
+                    _tmpl_ed_col, _ = st.columns([5, 1])
+                    with _tmpl_ed_col:
+                        edited = st.data_editor(
+                            df.style.map(_cell_style_t),
+                            column_config=col_cfg, use_container_width=True,
+                            key=f"tmpl_edit_{template_id}_{di}_{team['name']}",
+                            height=20 * len(TIME_SLOTS) + 40,
+                        )
                     if st.button(f"💾 Save {team['name']}",
                                  key=f"tmpl_save_{template_id}_{di}_{team['name']}",
                                  use_container_width=True, type="primary"):
-                        save_template_df(template_id, di, edited)
+                        save_template_df(template_id, di, edited[_tmpl_agent_cols])
                         st.toast(f"Saved {team['name']} for {day_name}.", icon="✅")
                         st.rerun()
 
@@ -2441,6 +4955,102 @@ def page_settings():
         This ensures cells are readable in both the timeline and the editor grid.
     </div>""", unsafe_allow_html=True)
 
+    # ── Slack integration ──────────────────────────────────────────────────────
+    st.divider()
+    st.markdown('<div style="font-size:13px;font-weight:600;color:#0F172A;margin-bottom:2px">Slack notifications</div>', unsafe_allow_html=True)
+    st.caption("Configure Slack to send channel alerts and direct messages to agents.")
+
+    _cur_webhook   = get_setting("slack_webhook_url",        "")
+    _cur_token     = get_setting("slack_bot_token",           "")
+    _cur_sub_notif = get_setting("slack_notify_submissions",  "yes" if _cur_webhook else "")
+    _cur_dm_notif  = get_setting("slack_dm_schedule_updates", "")
+
+    # ── Incoming Webhook (channel alerts) ────────────────────────────────────
+    st.markdown('<div style="font-size:12px;font-weight:600;color:#475569;margin:10px 0 4px">Channel alerts (Incoming Webhook)</div>', unsafe_allow_html=True)
+    st.caption("Posts to a Slack channel. No bot token needed. Create one at api.slack.com → Your App → Incoming Webhooks.")
+
+    with st.form("slack_webhook_form"):
+        webhook_input = st.text_input(
+            "Webhook URL",
+            value=_cur_webhook,
+            placeholder="https://hooks.slack.com/services/...",
+        )
+        _sub_notify = st.checkbox(
+            "Notify channel on new time-off submission",
+            value=(_cur_sub_notif == "yes"),
+            help="In addition to the existing approval/denial alerts."
+        )
+        sw1, sw2 = st.columns([2, 1])
+        with sw1:
+            if st.form_submit_button("Save", type="primary"):
+                url = webhook_input.strip()
+                if url and not url.startswith("https://hooks.slack.com/"):
+                    st.error("Must start with https://hooks.slack.com/")
+                else:
+                    set_setting("slack_webhook_url", url)
+                    set_setting("slack_notify_submissions", "yes" if _sub_notify else "no")
+                    st.success("Saved." if url else "Webhook cleared.")
+        with sw2:
+            if st.form_submit_button("Send test"):
+                set_setting("slack_webhook_url", webhook_input.strip())
+                send_slack_message("👋 Test from CX Scheduler — channel alerts are working!")
+                st.success("Sent!")
+
+    if _cur_webhook:
+        st.markdown('<div style="font-size:11px;color:#689985;margin-top:2px">✅ Webhook configured</div>', unsafe_allow_html=True)
+
+    # ── Bot Token (DMs) ───────────────────────────────────────────────────────
+    st.markdown('<div style="font-size:12px;font-weight:600;color:#475569;margin:14px 0 4px">Agent DMs (Bot Token)</div>', unsafe_allow_html=True)
+    st.caption(
+        "Sends a Slack DM to individual agents when their **today's** schedule is updated. "
+        "Requires a Slack Bot Token with `chat:write` and `im:write` scopes. "
+        "Each agent also needs their Slack Member ID set in their Roster profile."
+    )
+
+    with st.form("slack_dm_form"):
+        token_input = st.text_input(
+            "Bot Token",
+            value=_cur_token,
+            placeholder="xoxb-...",
+            type="password",
+            help="Create a Slack app at api.slack.com → OAuth & Permissions → Bot Token Scopes: chat:write, im:write, users:read"
+        )
+        _dm_sched = st.checkbox(
+            "DM agents when their today's schedule is updated",
+            value=(_cur_dm_notif == "yes"),
+        )
+        sd1, sd2 = st.columns([2, 1])
+        with sd1:
+            if st.form_submit_button("Save", type="primary"):
+                set_setting("slack_bot_token", token_input.strip())
+                set_setting("slack_dm_schedule_updates", "yes" if _dm_sched else "no")
+                st.success("Saved.")
+        with sd2:
+            if st.form_submit_button("Send test DM"):
+                _test_user = current_user()
+                if not token_input.strip():
+                    st.error("Enter a bot token first.")
+                else:
+                    set_setting("slack_bot_token", token_input.strip())
+                    set_setting("slack_dm_schedule_updates", "yes" if _dm_sched else "no")
+                    # Try to DM the current admin as a sanity check
+                    _conn_t = get_conn()
+                    _test_row = _conn_t.execute(
+                        "SELECT slack_user_id FROM agents WHERE name=?",
+                        (_test_user["display_name"] if _test_user else "",)
+                    ).fetchone()
+                    _conn_t.close()
+                    _sid = _test_row["slack_user_id"] if _test_row else None
+                    if _sid:
+                        send_slack_dm(_sid, "👋 Test DM from CX Scheduler — agent DMs are working!")
+                        st.success("Test DM sent to your Slack!")
+                    else:
+                        st.warning("Bot token saved. To test, add your own Slack Member ID in the Roster first.")
+
+    if _cur_token:
+        st.markdown('<div style="font-size:11px;color:#689985;margin-top:2px">✅ Bot token configured</div>', unsafe_allow_html=True)
+
+
 
 # ─── PAGE: USERS ──────────────────────────────────────────────────────────────
 
@@ -2553,12 +5163,12 @@ def page_reports():
     agents      = get_agents()
     teams       = get_teams()
     dyn_colors  = get_act_colors()
-    all_req = get_time_off_requests()
-    today   = datetime.date.today()
-    monday  = today - datetime.timedelta(days=today.weekday())
-    week_end = monday + datetime.timedelta(days=6)
+    all_req     = get_time_off_requests()
+    today       = datetime.date.today()
+    monday      = today - datetime.timedelta(days=today.weekday())
+    week_end    = monday + datetime.timedelta(days=6)
 
-    # PTO days this week
+    # ── Top metrics ───────────────────────────────────────────────────────────
     pto_days = sum(
         (min(datetime.date.fromisoformat(r["end_date"]), week_end)
          - max(datetime.date.fromisoformat(r["start_date"]), monday)).days + 1
@@ -2566,17 +5176,15 @@ def page_reports():
         and datetime.date.fromisoformat(r["start_date"]) <= week_end
         and datetime.date.fromisoformat(r["end_date"]) >= monday
     )
-
     c1, c2, c3, c4 = st.columns(4)
     with c1: metric("Total agents", len(agents))
     with c2: metric("Teams", len(teams))
     with c3: metric("PTO days this week", max(0, pto_days))
-    with c4: metric("Pending approvals", len([r for r in all_req if r["status"]=="Pending"]))
+    with c4: metric("Pending approvals", len([r for r in all_req if r["status"] == "Pending"]))
 
     st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
 
     c_left, c_right = st.columns(2)
-
     with c_left:
         st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:8px">Agents by team</div>', unsafe_allow_html=True)
         for team in teams:
@@ -2592,12 +5200,11 @@ def page_reports():
                     <div style="background:{team['color']};width:{pct}%;height:100%;border-radius:99px"></div>
                 </div>
             </div>""", unsafe_allow_html=True)
-
     with c_right:
         st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:8px">Time off by type</div>', unsafe_allow_html=True)
         if all_req:
-            df = pd.DataFrame(all_req)
-            by_type = df.groupby("type").size().reset_index(name="count").sort_values("count", ascending=False)
+            _df_req = pd.DataFrame(all_req)
+            by_type = _df_req.groupby("type").size().reset_index(name="count").sort_values("count", ascending=False)
             for _, row in by_type.iterrows():
                 bg, fg = dyn_colors.get(row["type"], ("#F1F5F9", "#475569"))
                 st.markdown(f"""
@@ -2609,23 +5216,237 @@ def page_reports():
         else:
             st.caption("No requests yet.")
 
-    st.markdown('<div style="height:20px"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="font-size:14px;font-weight:600;color:#0F172A;margin-bottom:8px">Recent time off requests</div>', unsafe_allow_html=True)
+    # ── Schedule Coverage ─────────────────────────────────────────────────────
+    st.markdown('<div style="height:24px"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-size:14px;font-weight:700;color:#0F172A;margin-bottom:10px">'
+        'Schedule Coverage</div>', unsafe_allow_html=True)
 
-    recent = sorted(all_req, key=lambda r: r["submitted_date"], reverse=True)[:10]
-    if recent:
-        df_show = pd.DataFrame([{
-            "Agent": r["agent_name"],
-            "Team":  r["team_name"],
-            "Type":  r["type"],
-            "Start": r["start_date"],
-            "End":   r["end_date"],
-            "Status": r["status"],
-            "Approved by": r["approved_by"],
-        } for r in recent])
-        st.dataframe(df_show, use_container_width=True, hide_index=True)
+    # Build 8-week options starting from this Monday
+    _ws_list   = [str(monday + datetime.timedelta(weeks=i)) for i in range(8)]
+    _team_opts = ["All Teams"] + [t["name"] for t in teams]
+
+    def _ws_label(ws):
+        d = datetime.date.fromisoformat(ws)
+        end = d + datetime.timedelta(days=4)
+        suffix = " · this week" if ws == str(monday) else ""
+        return f"{d.strftime('%-m/%-d')} – {end.strftime('%-m/%-d')}{suffix}"
+
+    _week_opts = ["All Upcoming"] + [_ws_label(ws) for ws in _ws_list]
+
+    # Default week selector to "this week" on first load
+    if "rpt_wk_sel" not in st.session_state:
+        st.session_state["rpt_wk_sel"] = _week_opts[1]  # first real week = this week
+
+    _f1, _f2, _fspc = st.columns([2.2, 2, 4])
+    with _f1:
+        _sel_wk = st.selectbox("Week", _week_opts, key="rpt_wk_sel")
+    with _f2:
+        _sel_tm = st.selectbox("Team", _team_opts, key="rpt_tm_sel")
+
+    # Agents for the filter
+    if _sel_tm == "All Teams":
+        _rpt_agents = agents
     else:
-        st.caption("No requests recorded yet.")
+        _rpt_agents = [a for a in agents if a["team_name"] == _sel_tm]
+    _rpt_names = [a["name"] for a in _rpt_agents]
+
+    _TIME_OFF_ACTS = {"PTO", "VTO", "Sick", "Holiday", "FMLA", "Bereavement"}
+    # Each schedule slot = 30 minutes
+    _SLOT_HRS = 0.5
+    # Named activities shown as individual columns in coverage tables
+    _NAMED_ACTS = ["Chat", "Phones", "Support", "CA-Remote", "CA-Studio", "GW", "Retail", "Design"]
+
+    def _week_summary(ws, names):
+        """Returns per-day hour totals summed across all agents for Mon–Fri.
+        2 agents × 5 hrs Support = 10 hrs Support."""
+        if not names:
+            return {}
+        conn = get_conn()
+        ph = ','.join('?' * len(names))
+        rows = conn.execute(
+            f"SELECT day_index, agent_name, activity FROM schedule_cells "
+            f"WHERE week_start=? AND day_index < 5 "
+            f"AND agent_name IN ({ph}) AND activity != '.'",
+            [ws] + names
+        ).fetchall()
+        conn.close()
+        from collections import defaultdict as _dd
+        day_slots = _dd(lambda: _dd(int))   # di -> activity -> slot count
+        day_pto   = _dd(set)                # di -> agent names on time-off
+        for r in rows:
+            day_slots[r["day_index"]][r["activity"]] += 1
+            if r["activity"] in _TIME_OFF_ACTS:
+                day_pto[r["day_index"]].add(r["agent_name"])
+        result = {}
+        for di in range(5):
+            acts = day_slots.get(di, {})
+            def _h(key): return round(acts.get(key, 0) * _SLOT_HRS, 1)
+            named_hrs  = {act: _h(act) for act in _NAMED_ACTS}
+            pto_h      = round(sum(v for k, v in acts.items() if k in _TIME_OFF_ACTS) * _SLOT_HRS, 1)
+            named_sum  = sum(named_hrs.values())
+            other_h    = round(max(0, sum(acts.values()) * _SLOT_HRS - named_sum - pto_h), 1)
+            total_h    = round(named_sum + other_h, 1)
+            result[di] = {
+                **{f"{act}_hrs": v for act, v in named_hrs.items()},
+                "other_hrs":  other_h,
+                "pto_agents": len(day_pto.get(di, set())),
+                "total_hrs":  total_h,
+            }
+        return result
+
+    def _fmt_h(h):
+        return f"{h:.1f}h" if h else "—"
+
+    # Resolve selected week string for the time-off section
+    _resolved_ws = None
+    if _sel_wk != "All Upcoming":
+        _ws_idx      = _week_opts.index(_sel_wk) - 1
+        _resolved_ws = _ws_list[_ws_idx]
+
+    if not _rpt_names:
+        st.caption("No agents in the selected team.")
+
+    elif _sel_wk == "All Upcoming":
+        # ── Multi-week hours table ────────────────────────────────────────────
+        _rows = []
+        for ws in _ws_list:
+            summ = _week_summary(ws, _rpt_names)
+            row = {"Week": _ws_label(ws)}
+            for di, day in enumerate(DAYS[:5]):
+                d = summ.get(di, {})
+                row[day[:3]] = _fmt_h(d.get("total_hrs", 0))
+            _rows.append(row)
+        st.dataframe(pd.DataFrame(_rows).set_index("Week"), use_container_width=True)
+        st.caption("Each cell = total scheduled hours across all matching agents for that day (excludes time-off slots).")
+
+    else:
+        # ── Specific week: hours by activity per day ──────────────────────────
+        _ws      = _resolved_ws
+        _ws_date = datetime.date.fromisoformat(_ws)
+        summ     = _week_summary(_ws, _rpt_names)
+
+        _cov_rows = []
+        for di, day in enumerate(DAYS[:5]):
+            _date_str = (_ws_date + datetime.timedelta(days=di)).strftime('%-m/%-d')
+            d = summ.get(di, {})
+            row = {"Day": f"{day} {_date_str}"}
+            for _act in _NAMED_ACTS:
+                row[_act] = _fmt_h(d.get(f"{_act}_hrs", 0))
+            row["Other"]   = _fmt_h(d.get("other_hrs", 0))
+            row["Total"]   = _fmt_h(d.get("total_hrs", 0))
+            row["🌴 Out"]  = d.get("pto_agents", 0) or "—"
+            _cov_rows.append(row)
+        st.dataframe(pd.DataFrame(_cov_rows).set_index("Day"), use_container_width=True)
+
+    # ── Upcoming Time Off ─────────────────────────────────────────────────────
+    st.markdown('<div style="height:24px"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-size:14px;font-weight:700;color:#0F172A;margin-bottom:8px">'
+        'Upcoming Time Off</div>', unsafe_allow_html=True)
+
+    if _sel_wk == "All Upcoming":
+        # All future approved/pending requests from today forward
+        _pto_reqs = [
+            r for r in all_req
+            if r["status"] in ("Approved", "Pending")
+            and datetime.date.fromisoformat(r["end_date"]) >= today
+            and (_sel_tm == "All Teams" or r["team_name"] == _sel_tm)
+        ]
+    else:
+        # Requests overlapping the selected week (Mon–Fri)
+        _ws_date2 = datetime.date.fromisoformat(_resolved_ws)
+        _ws_end2  = _ws_date2 + datetime.timedelta(days=4)
+        _pto_reqs = [
+            r for r in all_req
+            if r["status"] in ("Approved", "Pending")
+            and datetime.date.fromisoformat(r["start_date"]) <= _ws_end2
+            and datetime.date.fromisoformat(r["end_date"])   >= _ws_date2
+            and (_sel_tm == "All Teams" or r["team_name"] == _sel_tm)
+        ]
+
+    _pto_reqs = sorted(_pto_reqs, key=lambda r: r["start_date"])
+
+    if _pto_reqs:
+        _df_pto = pd.DataFrame([{
+            "Agent":  r["agent_name"],
+            "Team":   r["team_name"],
+            "Type":   r["type"],
+            "Start":  r["start_date"],
+            "End":    r["end_date"],
+            "Status": r["status"],
+        } for r in _pto_reqs])
+        st.dataframe(_df_pto, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No upcoming time off for this selection.")
+
+
+# ─── PAGE: PROFILE ────────────────────────────────────────────────────────────
+
+def page_profile():
+    user = current_user()
+    if not user:
+        st.error("Not logged in.")
+        return
+
+    FONT = "'DM Sans','Apercu Pro',Helvetica,Arial,sans-serif"
+    role_colors = {"admin": "#EEE171", "editor": "#89AC9E", "viewer": "#979797"}
+    rc = role_colors.get(user["role"], "#94A3B8")
+    initials = "".join(p[0] for p in user["display_name"].split()[:2]).upper()
+
+    st.markdown('<div class="page-title">My Profile</div>', unsafe_allow_html=True)
+
+    # ── User info card ────────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="display:flex;align-items:center;gap:16px;padding:20px 24px;
+                background:white;border:1px solid #E2E8F0;border-radius:10px;
+                margin-bottom:24px;font-family:{FONT}">
+        <div style="width:52px;height:52px;border-radius:50%;background:{rc}22;
+                    color:{rc};font-size:18px;font-weight:700;display:flex;
+                    align-items:center;justify-content:center;flex-shrink:0">
+            {initials}
+        </div>
+        <div>
+            <div style="font-size:17px;font-weight:700;color:#0F172A;line-height:1.2">
+                {user["display_name"]}
+            </div>
+            <div style="font-size:12px;color:{rc};font-weight:600;
+                        text-transform:capitalize;margin-top:3px">
+                {user["role"]}
+            </div>
+            <div style="font-size:12px;color:#94A3B8;margin-top:2px">
+                @{user["username"]}
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Change password form ──────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="font-size:14px;font-weight:700;color:#0F172A;margin-bottom:10px;'
+        f'font-family:{FONT}">Change Password</div>', unsafe_allow_html=True)
+
+    with st.form("change_pw_form", clear_on_submit=True):
+        current_pw = st.text_input("Current password", type="password")
+        new_pw     = st.text_input("New password",     type="password")
+        confirm_pw = st.text_input("Confirm new password", type="password")
+        submitted  = st.form_submit_button("Update Password", type="primary")
+
+    if submitted:
+        if not current_pw or not new_pw or not confirm_pw:
+            st.error("All three fields are required.")
+        elif len(new_pw) < 6:
+            st.error("New password must be at least 6 characters.")
+        elif new_pw != confirm_pw:
+            st.error("New passwords don't match.")
+        else:
+            # Fetch fresh hash from DB to verify current password
+            _db_user = get_user_by_id(user["id"])
+            if not _db_user or not _verify_pw(current_pw, _db_user["password_hash"]):
+                st.error("Current password is incorrect.")
+            else:
+                reset_password(user["id"], new_pw.strip())
+                st.success("Password updated successfully!")
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -2640,16 +5461,43 @@ def main():
         return   # show_login calls st.stop() but return is here for clarity
 
     page = sidebar()
+    user = current_user()
+
+    # Auto-close profile when the user clicks a different nav item
+    _pnk = "_cx_prof_prev_nav"
+    if st.session_state.get(_pnk) != page and st.session_state.get("_cx_profile_open"):
+        st.session_state["_cx_profile_open"] = False
+    st.session_state[_pnk] = page
+
+    # ── Profile icon — top-right of every page ────────────────────────────────
+    _hdr_l, _hdr_r = st.columns([11, 1])
+    with _hdr_r:
+        if user:
+            _initials = "".join(p[0] for p in user["display_name"].split()[:2]).upper()
+            _prof_open = st.session_state.get("_cx_profile_open", False)
+            if st.button(
+                _initials,
+                key="profile_icon_btn",
+                help="My Profile · Change Password",
+                type="primary" if _prof_open else "secondary",
+            ):
+                st.session_state["_cx_profile_open"] = not _prof_open
+                st.rerun()
+
+    if st.session_state.get("_cx_profile_open"):
+        page_profile()
+        return
 
     page_map = {
-        "Schedule":  page_schedule,
-        "Time Off":  page_timeoff,
-        "Roster":    page_roster,
-        "Teams":     page_teams,
-        "Templates": page_templates,
-        "Users":     page_users,
-        "Settings":  page_settings,
-        "Reports":   page_reports,
+        "Schedule":   page_schedule,
+        "Time Off":   page_timeoff,
+        "Agent View": page_agent_view,
+        "Roster":     page_roster,
+        "Teams":      page_teams,
+        "Templates":  page_templates,
+        "Users":      page_users,
+        "Settings":   page_settings,
+        "Reports":    page_reports,
     }
     fn = page_map.get(page)
     if fn:
