@@ -7,39 +7,13 @@ import hashlib
 import secrets
 import math
 from pathlib import Path
-import threading as _threading
-import http.server as _http_server
-import socket as _socket
-
-@st.cache_resource
-def _launch_editor_server():
-    """Serve cx_component/ from a background HTTP server so declare_component url= works."""
-    comp_dir = str(Path(__file__).parent / "cx_component")
-    port = 3011
-    for p in range(3011, 3099):
-        try:
-            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
-                s.bind(("localhost", p))
-            port = p
-            break
-        except OSError:
-            continue
-
-    class _H(_http_server.SimpleHTTPRequestHandler):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, directory=comp_dir, **kw)
-        def log_message(self, *a):
-            pass
-
-    srv = _http_server.HTTPServer(("localhost", port), _H)
-    _threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return port
+_COMPONENT_PATH = str(Path(__file__).parent / "cx_component")
 
 st.set_page_config(
     page_title="CX Schedule",
     page_icon="📅",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 DB_PATH = Path(__file__).parent / "cx_scheduler.db"
@@ -2362,20 +2336,12 @@ def inject_css():
     [data-testid="stStatusWidget"] {{ display: none !important }}
     header {{ background: transparent !important; border-bottom: none !important }}
 
-    /* ── Lock sidebar permanently open — no collapse/expand toggle ── */
+    /* ── Sidebar — fixed width when open, collapsible ── */
     section[data-testid="stSidebar"] {{
         width: 18rem !important;
         min-width: 18rem !important;
-        transform: none !important;
-        margin-left: 0 !important;
-        display: flex !important;
-        visibility: visible !important;
     }}
-    section[data-testid="stSidebar"][aria-expanded="false"] {{
-        transform: none !important;
-        margin-left: 0 !important;
-        width: 18rem !important;
-    }}
+    /* Hide the built-in collapse/expand arrows — we use our own toggle button */
     [data-testid="stSidebarCollapseButton"],
     [data-testid="collapsedControl"] {{ display: none !important }}
 
@@ -2385,7 +2351,7 @@ def inject_css():
     /* ── Sidebar ── */
     [data-testid="stSidebar"]>div:first-child{{background:var(--fb-black)!important;padding-top:0}}
     [data-testid="stSidebar"] *{{color:#C8C5C0!important;font-family:var(--font-ui)!important}}
-    [data-testid="stSidebar"] .stRadio>label{{display:none}}
+    [data-testid="stSidebar"] .stRadio>label{{display:none!important}}
     [data-testid="stSidebar"] .stRadio div[role="radiogroup"]{{gap:0!important}}
     [data-testid="stSidebar"] .stRadio label{{
         display:flex!important;align-items:center;
@@ -2640,8 +2606,14 @@ def sidebar():
                           title="{_scheduled} of {_total} scheduled today">{_scheduled}/{_total}</span>
                 </div>""", unsafe_allow_html=True)
 
+        # Hide sidebar toggle
+        st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+        if st.button("← Hide menu", key="hide_sidebar_btn", use_container_width=True):
+            st.session_state["_cx_sidebar_hidden"] = True
+            st.rerun()
+
         # Logout — pushed to the very bottom of the sidebar
-        st.markdown('<div style="height:80px"></div>', unsafe_allow_html=True)
+        st.markdown('<div style="height:32px"></div>', unsafe_allow_html=True)
         st.markdown(
             '<style>'
             '[data-testid="stSidebar"] > div:first-child {'
@@ -3510,10 +3482,11 @@ def page_schedule():
     st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
 
     # Declare the schedule editor component ONCE, unconditionally.
-    _eport = _launch_editor_server()
+    # path= tells Streamlit to serve the files itself — works for all users,
+    # unlike url=localhost which only works on the developer's machine.
     _sched_editor = st_components.declare_component(
         "cx_schedule_editor",
-        url=f"http://localhost:{_eport}",
+        path=_COMPONENT_PATH,
     )
 
     # Render only the active day — a single pass, no loop
@@ -3827,12 +3800,6 @@ def page_agent_view():
             unsafe_allow_html=True,
         )
 
-    st.markdown(
-        f'<div style="font-size:13px;color:#64748B;margin-bottom:10px">'
-        f'Week of <b style="color:#0F172A">{sel.strftime("%B %-d, %Y")}</b></div>',
-        unsafe_allow_html=True,
-    )
-
     agents_all  = get_agents()
     teams       = get_teams()
     team_colors = {t["name"]: t["color"] for t in teams}
@@ -3851,59 +3818,76 @@ def page_agent_view():
                          if any(a["team_name"] == t["name"] for a in agents_info)]
     _av_user = current_user()
     _ordered_teams, _tl_order_key = resolve_team_order(_av_user, teams_with_agents)
-
     n_rows = len(TIME_SLOTS) * 26 + 120
 
-    # ── Day tabs ──────────────────────────────────────────────────────────────
-    day_tabs = st.tabs([
-        f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
-        for i, d in enumerate(DAYS)
-    ])
-    _default_to_today_tab(week_start)
-    for di, dtab in enumerate(day_tabs):
-        with dtab:
-            # Load schedule for the day
-            day_sched = {}
-            for ag in agents_all:
-                df = get_schedule_df(week_start, di, [ag["name"]])
-                day_sched[ag["name"]] = df[ag["name"]].to_dict()
+    # ── Top-level tabs: personal view + team view ─────────────────────────────
+    my_tab, team_tab = st.tabs(["👤  My Schedule", "👥  Team View"])
 
-            for _i, team in enumerate(_ordered_teams):
-                team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
-                if not team_agents:
-                    continue
+    with my_tab:
+        _linked_agent = next((a for a in agents_all if a.get("linked_user_id") == user["id"]), None)
+        _name_agent   = next((a for a in agents_all if a["name"] == user["display_name"]), None)
+        _my_agent     = _linked_agent or _name_agent
+        if _my_agent:
+            _agent_hour_breakdown(_my_agent["name"], week_start)
+        else:
+            st.info("Your roster profile hasn't been set up yet, or hasn't been linked to this account. Ask an admin to add you to the Roster and link your login.")
 
-                _hcol, _ucol, _dcol = st.columns([30, 1, 1])
-                with _hcol:
-                    st.markdown(
-                        f'<div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">'
-                        f'<div style="width:10px;height:10px;border-radius:50%;background:{team["color"]}"></div>'
-                        f'<span style="font-size:13px;font-weight:600;color:#1E293B">{team["name"]} Team</span>'
-                        f'<span style="font-size:11px;color:#94A3B8">— {len(team_agents)} agents</span>'
-                        f'</div>', unsafe_allow_html=True
+    with team_tab:
+        st.markdown(
+            f'<div style="font-size:13px;color:#64748B;margin-bottom:10px">'
+            f'Week of <b style="color:#0F172A">{sel.strftime("%B %-d, %Y")}</b></div>',
+            unsafe_allow_html=True,
+        )
+        # ── Day tabs ──────────────────────────────────────────────────────────
+        day_tabs = st.tabs([
+            f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
+            for i, d in enumerate(DAYS)
+        ])
+        _default_to_today_tab(week_start)
+        for di, dtab in enumerate(day_tabs):
+            with dtab:
+                # Load schedule for the day
+                day_sched = {}
+                for ag in agents_all:
+                    df = get_schedule_df(week_start, di, [ag["name"]])
+                    day_sched[ag["name"]] = df[ag["name"]].to_dict()
+
+                for _i, team in enumerate(_ordered_teams):
+                    team_agents = [a for a in agents_info if a["team_name"] == team["name"]]
+                    if not team_agents:
+                        continue
+
+                    _hcol, _ucol, _dcol = st.columns([30, 1, 1])
+                    with _hcol:
+                        st.markdown(
+                            f'<div style="display:flex;align-items:center;gap:8px;margin:10px 0 4px">'
+                            f'<div style="width:10px;height:10px;border-radius:50%;background:{team["color"]}"></div>'
+                            f'<span style="font-size:13px;font-weight:600;color:#1E293B">{team["name"]} Team</span>'
+                            f'<span style="font-size:11px;color:#94A3B8">— {len(team_agents)} agents</span>'
+                            f'</div>', unsafe_allow_html=True
+                        )
+                    with _ucol:
+                        if st.button("↑", key=f"av_up_{di}_{team['name']}",
+                                     disabled=(_i == 0), help="Move up"):
+                            _ord = st.session_state[_tl_order_key]
+                            _idx = _ord.index(team["name"])
+                            _ord[_idx], _ord[_idx-1] = _ord[_idx-1], _ord[_idx]
+                            save_user_team_order(_av_user["id"], _ord)
+                            st.rerun()
+                    with _dcol:
+                        if st.button("↓", key=f"av_dn_{di}_{team['name']}",
+                                     disabled=(_i == len(_ordered_teams)-1), help="Move down"):
+                            _ord = st.session_state[_tl_order_key]
+                            _idx = _ord.index(team["name"])
+                            _ord[_idx], _ord[_idx+1] = _ord[_idx+1], _ord[_idx]
+                            save_user_team_order(_av_user["id"], _ord)
+                            st.rerun()
+                    team_sched = {a["name"]: day_sched.get(a["name"], {}) for a in team_agents}
+                    st_components.html(
+                        build_timeline_html(team_agents, team_sched, act_colors,
+                                            slot_label_map=slot_lbl_map),
+                        height=n_rows, scrolling=False,
                     )
-                with _ucol:
-                    if st.button("↑", key=f"av_up_{di}_{team['name']}",
-                                 disabled=(_i == 0), help="Move up"):
-                        _ord = st.session_state[_tl_order_key]
-                        _idx = _ord.index(team["name"])
-                        _ord[_idx], _ord[_idx-1] = _ord[_idx-1], _ord[_idx]
-                        save_user_team_order(_av_user["id"], _ord)
-                        st.rerun()
-                with _dcol:
-                    if st.button("↓", key=f"av_dn_{di}_{team['name']}",
-                                 disabled=(_i == len(_ordered_teams)-1), help="Move down"):
-                        _ord = st.session_state[_tl_order_key]
-                        _idx = _ord.index(team["name"])
-                        _ord[_idx], _ord[_idx+1] = _ord[_idx+1], _ord[_idx]
-                        save_user_team_order(_av_user["id"], _ord)
-                        st.rerun()
-                team_sched = {a["name"]: day_sched.get(a["name"], {}) for a in team_agents}
-                st_components.html(
-                    build_timeline_html(team_agents, team_sched, act_colors,
-                                        slot_label_map=slot_lbl_map),
-                    height=n_rows, scrolling=False,
-                )
 
 
 # ─── PAGE: TIME OFF ───────────────────────────────────────────────────────────
@@ -5463,14 +5447,33 @@ def main():
     page = sidebar()
     user = current_user()
 
+    # ── Sidebar hide/show ─────────────────────────────────────────────────────
+    if st.session_state.get("_cx_sidebar_hidden"):
+        st.markdown("""
+        <style>
+        section[data-testid="stSidebar"],
+        [data-testid="collapsedControl"] {
+            display: none !important;
+            width: 0 !important;
+            min-width: 0 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
     # Auto-close profile when the user clicks a different nav item
     _pnk = "_cx_prof_prev_nav"
     if st.session_state.get(_pnk) != page and st.session_state.get("_cx_profile_open"):
         st.session_state["_cx_profile_open"] = False
     st.session_state[_pnk] = page
 
-    # ── Profile icon — top-right of every page ────────────────────────────────
+    # ── Header row: menu toggle (left) + profile icon (right) ─────────────────
+    _sidebar_hidden = st.session_state.get("_cx_sidebar_hidden", False)
     _hdr_l, _hdr_r = st.columns([11, 1])
+    with _hdr_l:
+        if _sidebar_hidden:
+            if st.button("☰ Menu", key="show_sidebar_btn", help="Show navigation menu"):
+                st.session_state["_cx_sidebar_hidden"] = False
+                st.rerun()
     with _hdr_r:
         if user:
             _initials = "".join(p[0] for p in user["display_name"].split()[:2]).upper()
