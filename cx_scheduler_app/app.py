@@ -2341,9 +2341,10 @@ def inject_css():
         width: 18rem !important;
         min-width: 18rem !important;
     }}
-    /* Hide the built-in collapse/expand arrows — we use our own toggle button */
-    [data-testid="stSidebarCollapseButton"],
-    [data-testid="collapsedControl"] {{ display: none !important }}
+    /* Keep collapse button hidden inside sidebar (we rely on native collapse arrow at edge) */
+    [data-testid="stSidebarCollapseButton"] {{ display: none !important }}
+    /* Show the expand control so mobile users can reopen the sidebar */
+    [data-testid="collapsedControl"] {{ display: flex !important }}
 
     .stApp{{background:var(--fb-cream)!important}}
     div[data-testid="stMainBlockContainer"]{{padding:1.5rem 2rem}}
@@ -2351,19 +2352,21 @@ def inject_css():
     /* ── Sidebar ── */
     [data-testid="stSidebar"]>div:first-child{{background:var(--fb-black)!important;padding-top:0}}
     [data-testid="stSidebar"] *{{color:#C8C5C0!important;font-family:var(--font-ui)!important}}
-    [data-testid="stSidebar"] .stRadio>label{{display:none!important}}
+    /* Hide the radio group title label ("nav") — must be more specific than the option rule below */
+    [data-testid="stSidebar"] [data-testid="stRadio"] > div > [data-testid="stWidgetLabel"]{{display:none!important}}
     [data-testid="stSidebar"] .stRadio div[role="radiogroup"]{{gap:0!important}}
-    [data-testid="stSidebar"] .stRadio label{{
+    /* Style individual nav option labels only — scoped to radiogroup to avoid hitting the title label */
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label{{
         display:flex!important;align-items:center;
         padding:10px 16px!important;border-radius:4px!important;
         margin:1px 6px!important;cursor:pointer!important;
         transition:background 0.15s;font-size:13px!important;
         letter-spacing:0.03em!important;font-family:var(--font-ui)!important}}
-    [data-testid="stSidebar"] .stRadio label:hover{{background:rgba(255,255,255,0.07)!important}}
-    [data-testid="stSidebar"] .stRadio label[data-checked="true"]{{
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label:hover{{background:rgba(255,255,255,0.07)!important}}
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label[data-checked="true"]{{
         background:rgba(137,172,158,0.25)!important;
         border-left:2px solid var(--fb-sage)!important}}
-    [data-testid="stSidebar"] .stRadio label[data-checked="true"] *{{
+    [data-testid="stSidebar"] .stRadio div[role="radiogroup"] > label[data-checked="true"] *{{
         color:white!important;font-weight:500!important}}
     [data-testid="stSidebar"] div[data-testid="stVerticalBlock"]{{gap:0!important}}
 
@@ -2420,6 +2423,21 @@ def inject_css():
     [data-testid="stButton"] button[kind="primary"]:hover,
     button[kind="primary"]:hover{{
         background:var(--fb-charcoal)!important}}
+
+    /* ── Sidebar secondary buttons (hide control, mark-read, etc.) ── */
+    [data-testid="stSidebar"] button[kind="secondary"] {{
+        font-size:10px!important;font-weight:400!important;
+        min-height:20px!important;height:20px!important;
+        padding:0 8px!important;letter-spacing:0.05em!important;
+        background:transparent!important;border:none!important;box-shadow:none!important;
+        color:#475569!important;text-transform:none!important}}
+    [data-testid="stSidebar"] button[kind="secondary"]:hover {{
+        background:transparent!important;color:#94A3B8!important}}
+    /* ── Sign Out (primary in sidebar) — keep as outlined white button ── */
+    [data-testid="stSidebar"] button[kind="primary"] {{
+        background:rgba(255,255,255,0.06)!important;
+        color:#C8C5C0!important;
+        border:1px solid rgba(255,255,255,0.18)!important}}
 
     /* ── Tabs ── */
     div[data-testid="stTabs"] button{{
@@ -2515,6 +2533,11 @@ def sidebar():
             </div>
         </div>""", unsafe_allow_html=True)
 
+        # Tiny hide-menu link, right-aligned under the header
+        if st.button("‹ hide", key="hide_sidebar_btn", use_container_width=True):
+            st.session_state["_cx_sidebar_hidden"] = True
+            st.rerun()
+
         # Logged-in user badge
         if user:
             role_colors = {"admin": "#EEE171", "editor": "#89AC9E", "viewer": "#979797"}
@@ -2562,9 +2585,9 @@ def sidebar():
         # Build nav based on role
         nav_labels = ["⬛  Schedule", "📥  Time Off"]
         if can_edit():
-            nav_labels += ["🌐  Agent View", "👤  Roster", "🏷️  Teams", "📋  Templates", "📊  Reports"]
+            nav_labels += ["🌐  Agent View"]
         if is_admin():
-            nav_labels += ["👥  Users", "⚙️  Settings"]
+            nav_labels += ["👤  Roster", "🏷️  Teams", "📋  Templates", "📊  Reports", "👥  Users", "⚙️  Settings"]
 
         page = st.radio("nav", nav_labels, label_visibility="collapsed")
 
@@ -2578,42 +2601,8 @@ def sidebar():
                     Time off requests</div>
             </div>""", unsafe_allow_html=True)
 
-        # Team legend — counts agents scheduled today (at least one active slot)
-        teams = get_teams()
-        if teams:
-            _today        = datetime.date.today()
-            _today_ws     = str(_today - datetime.timedelta(days=_today.weekday()))
-            _today_di     = _today.weekday()
-            _unscheduled  = {".", "", None}
-
-            st.markdown('<div style="margin:16px 8px 6px;font-size:10px;font-weight:600;color:#475569;letter-spacing:.06em">TEAMS</div>', unsafe_allow_html=True)
-            for t in teams:
-                _team_agents = get_agent_names(t["name"])
-                _scheduled   = 0
-                if _team_agents:
-                    _df = get_schedule_df(_today_ws, _today_di, _team_agents)
-                    for _ag in _team_agents:
-                        if _ag in _df.columns and any(
-                            v not in _unscheduled for v in _df[_ag]
-                        ):
-                            _scheduled += 1
-                _total = len(_team_agents)
-                st.markdown(f"""
-                <div style="display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px">
-                    <div style="width:8px;height:8px;border-radius:50%;background:{t['color']};flex-shrink:0"></div>
-                    <span style="font-size:12px;color:#CBD5E1">{t['name']}</span>
-                    <span style="font-size:10px;color:#475569;margin-left:auto"
-                          title="{_scheduled} of {_total} scheduled today">{_scheduled}/{_total}</span>
-                </div>""", unsafe_allow_html=True)
-
-        # Hide sidebar toggle
-        st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
-        if st.button("← Hide menu", key="hide_sidebar_btn", use_container_width=True):
-            st.session_state["_cx_sidebar_hidden"] = True
-            st.rerun()
-
         # Logout — pushed to the very bottom of the sidebar
-        st.markdown('<div style="height:32px"></div>', unsafe_allow_html=True)
+        st.markdown('<div style="height:40px"></div>', unsafe_allow_html=True)
         st.markdown(
             '<style>'
             '[data-testid="stSidebar"] > div:first-child {'
@@ -2627,7 +2616,7 @@ def sidebar():
             '</style>',
             unsafe_allow_html=True
         )
-        if st.button("Sign out", use_container_width=True, key="signout_btn"):
+        if st.button("Sign out", use_container_width=True, key="signout_btn", type="primary"):
             st.session_state.pop("cx_user", None)
             st.rerun()
 
@@ -5454,11 +5443,9 @@ def main():
         section[data-testid="stSidebar"],
         [data-testid="collapsedControl"] {
             display: none !important;
-            width: 0 !important;
-            min-width: 0 !important;
+            width: 0 !important; min-width: 0 !important;
         }
-        </style>
-        """, unsafe_allow_html=True)
+        </style>""", unsafe_allow_html=True)
 
     # Auto-close profile when the user clicks a different nav item
     _pnk = "_cx_prof_prev_nav"
@@ -5466,12 +5453,11 @@ def main():
         st.session_state["_cx_profile_open"] = False
     st.session_state[_pnk] = page
 
-    # ── Header row: menu toggle (left) + profile icon (right) ─────────────────
-    _sidebar_hidden = st.session_state.get("_cx_sidebar_hidden", False)
+    # ── Header: ☰ show-menu (when hidden) + profile icon ─────────────────────
     _hdr_l, _hdr_r = st.columns([11, 1])
     with _hdr_l:
-        if _sidebar_hidden:
-            if st.button("☰ Menu", key="show_sidebar_btn", help="Show navigation menu"):
+        if st.session_state.get("_cx_sidebar_hidden"):
+            if st.button("☰", key="show_sidebar_btn", help="Show navigation menu"):
                 st.session_state["_cx_sidebar_hidden"] = False
                 st.rerun()
     with _hdr_r:
