@@ -83,17 +83,18 @@ def _make_time_slots():
 TIME_SLOTS = _make_time_slots()
 DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
-def _default_to_today_tab(week_start):
+def _default_to_today_tab(week_start, key_prefix="sched_day_tab__"):
     """
     When viewing the current week, inject a one-shot JS snippet that clicks
     today's day tab.  sessionStorage prevents re-clicking on Streamlit reruns.
+    Pass a unique key_prefix per page so different views don't share the flag.
     """
     today = datetime.date.today()
     current_monday = str(today - datetime.timedelta(days=today.weekday()))
     if week_start != current_monday:
         return
     label = DAYS[today.weekday()][:3]   # "Mon", "Tue", …
-    ss_key = f"sched_day_tab__{week_start}"
+    ss_key = f"{key_prefix}{week_start}"
     st_components.html(
         f"""<script>
 (function(){{
@@ -339,6 +340,11 @@ def init_db():
     if "split_end_slot" not in _col_names("agent_work_hours"):
         c.execute("ALTER TABLE agent_work_hours ADD COLUMN split_end_slot TEXT DEFAULT NULL")
         conn.commit()
+
+    try:
+        get_conn().execute("ALTER TABLE agent_coverage_rules ADD COLUMN lunch_overrides TEXT DEFAULT NULL")
+    except Exception:
+        pass
 
     if c.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0:
         c.executemany(
@@ -733,6 +739,11 @@ def save_schedule_df(week_start, day_index, df, notify=True):
             """, (week_start, day_index, slot, agent, act))
     conn.commit()
     conn.close()
+    # Stamp who saved and when so other users' watchers can detect the change
+    _saver = current_user()
+    _saver_name = _saver["display_name"] if _saver else "Someone"
+    set_setting("schedule_last_modified",
+                f"{datetime.datetime.now().isoformat()}|{_saver_name}")
     # Create notifications for agents whose schedule changed
     if notify:
         day_name = DAYS[day_index] if day_index < len(DAYS) else f"Day {day_index}"
@@ -967,6 +978,12 @@ def update_request_status(req_id, status, approved_by=""):
     if req:
         apply_single_timeoff(req)
 
+def delete_time_off_request(req_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM time_off_requests WHERE id=?", (req_id,))
+    conn.commit()
+    conn.close()
+
 def apply_single_timeoff(req):
     """Write a single approved time-off request into schedule_cells immediately."""
     rtype = req.get("type", "")
@@ -1146,14 +1163,6 @@ def apply_base_schedule(week_start, overwrite=False):
         if not default:
             continue  # Skip agents with no default activity configured
         lunch_rules   = agent_rules.get(ag["name"], {})
-        lunch_slot    = lunch_rules.get("lunch_slot") or None
-        lunch_dur     = int(lunch_rules.get("lunch_duration", 1))
-        # Build set of lunch slots for this agent
-        if lunch_slot and lunch_slot in TIME_SLOTS:
-            li = TIME_SLOTS.index(lunch_slot)
-            lunch_slots = set(TIME_SLOTS[li:li + lunch_dur])
-        else:
-            lunch_slots = set()
         for di in range(len(DAYS)):
             day_cfg = wh.get(di)
             if not day_cfg or not day_cfg["is_active"]:
@@ -1176,6 +1185,13 @@ def apply_base_schedule(week_start, overwrite=False):
                 if _spei > _spi:
                     _ranges.append(TIME_SLOTS[_spi:_spei])
             conn = get_conn()
+            _day_abbr = DAYS[di][:3]
+            _lunch_slot, _lunch_dur = _resolve_lunch(lunch_rules, _day_abbr)
+            if _lunch_slot and _lunch_slot in TIME_SLOTS:
+                _li = TIME_SLOTS.index(_lunch_slot)
+                lunch_slots = set(TIME_SLOTS[_li:_li + _lunch_dur])
+            else:
+                lunch_slots = set()
             for _slot_range in _ranges:
                 for slot in _slot_range:
                     activity = "Break" if slot in lunch_slots else default
@@ -1777,21 +1793,21 @@ def save_coverage_rules(agent_df, global_rules_dict):
     c = conn.cursor()
     # Preserve existing lunch values before wiping
     existing_lunch = {
-        row["agent_name"]: (row["lunch_slot"], row["lunch_duration"])
-        for row in c.execute("SELECT agent_name, lunch_slot, lunch_duration FROM agent_coverage_rules").fetchall()
+        row["agent_name"]: (row["lunch_slot"], row["lunch_duration"], row["lunch_overrides"])
+        for row in c.execute("SELECT agent_name, lunch_slot, lunch_duration, lunch_overrides FROM agent_coverage_rules").fetchall()
     }
     c.execute("DELETE FROM agent_coverage_rules")
     for _, row in agent_df.iterrows():
-        ls, ld = existing_lunch.get(row["Agent"], (None, 1))
+        ls, ld, lo = existing_lunch.get(row["Agent"], (None, 1, None))
         ch = row["Channels"]
         # Guard against NaN (cleared selectbox) — fall back to "both"
         if not isinstance(ch, str) or ch not in ("both", "chat", "phones", "none"):
             ch = "both"
         c.execute(
             """INSERT INTO agent_coverage_rules
-               (agent_name, allowed_channels, lunch_slot, lunch_duration)
-               VALUES (?,?,?,?)""",
-            (row["Agent"], ch, ls, int(ld) if ld is not None else 1),
+               (agent_name, allowed_channels, lunch_slot, lunch_duration, lunch_overrides)
+               VALUES (?,?,?,?,?)""",
+            (row["Agent"], ch, ls, int(ld) if ld is not None else 1, lo),
         )
     for key, val in global_rules_dict.items():
         # Booleans → "1"/"0"; strings (slot names, etc.) → stored as-is
@@ -1827,6 +1843,55 @@ def save_agent_lunch(agent_name, lunch_slot, lunch_duration):
         )
     conn.commit()
     conn.close()
+
+
+def save_agent_lunch_overrides(agent_name, overrides: dict):
+    """Persist per-day lunch overrides for one agent.
+    overrides = {day_abbr: {"slot": "12:00 PM", "duration": 2} or None}
+    Missing keys mean 'use default'. None value means 'no lunch that day'.
+    """
+    import json as _json
+    overrides_json = _json.dumps(overrides) if overrides else None
+    conn = get_conn()
+    existing = conn.execute(
+        "SELECT agent_name FROM agent_coverage_rules WHERE agent_name=?", (agent_name,)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE agent_coverage_rules SET lunch_overrides=? WHERE agent_name=?",
+            (overrides_json, agent_name),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO agent_coverage_rules (agent_name, allowed_channels, lunch_overrides) VALUES (?,?,?)",
+            (agent_name, "both", overrides_json),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _resolve_lunch(rules: dict, day_abbr: str):
+    """Return (lunch_slot_or_None, lunch_duration) for a given day,
+    applying any per-day override from rules['lunch_overrides'].
+    day_abbr is the 3-letter abbreviation e.g. 'Mon', 'Tue', 'Sat'.
+    """
+    import json as _json
+    raw = rules.get("lunch_overrides")
+    if raw:
+        try:
+            overrides = _json.loads(raw)
+            if day_abbr in overrides:
+                day_val = overrides[day_abbr]
+                if day_val is None:
+                    return None, 1          # explicit "no lunch" this day
+                slot = day_val.get("slot")
+                dur  = int(day_val.get("duration", 1))
+                return (slot or None), dur
+        except Exception:
+            pass
+    slot = rules.get("lunch_slot") or None
+    dur  = int(rules.get("lunch_duration", 1))
+    return slot, dur
 
 
 # ─── GLADLY IMPORT HELPERS ────────────────────────────────────────────────────
@@ -2040,8 +2105,8 @@ def build_gladly_template(gladly_data, db_agent_names,
         if cur in _HARD_BLOCK:
             return False
 
-        lunch_sl = rules.get("lunch_slot") or None
-        lunch_d  = int(rules.get("lunch_duration", 1))
+        _day_abbr_cov = DAYS[di][:3] if di < len(DAYS) else ""
+        lunch_sl, lunch_d = _resolve_lunch(rules, _day_abbr_cov)
         if lunch_sl and lunch_sl in TIME_SLOTS:
             li = TIME_SLOTS.index(lunch_sl)
             if li <= si < li + lunch_d:
@@ -2496,6 +2561,49 @@ def inject_css():
         white-space: nowrap !important;
         line-height: 1.4 !important;
     }}
+
+    /* ── Mobile layout ────────────────────────────────────────── */
+    @media screen and (max-width: 768px) {{
+        /* Style the sidebar hamburger as a clearly-visible floating button */
+        [data-testid="collapsedControl"] {{
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            position: fixed !important;
+            top: 6px !important;
+            left: 6px !important;
+            z-index: 99999 !important;
+            min-width: 48px !important;
+            min-height: 48px !important;
+            background: var(--fb-black) !important;
+            border-radius: 10px !important;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3) !important;
+        }}
+        [data-testid="collapsedControl"] button {{
+            min-width: 48px !important;
+            min-height: 48px !important;
+        }}
+        [data-testid="collapsedControl"] svg {{
+            width: 22px !important;
+            height: 22px !important;
+            color: #C8C5C0 !important;
+            fill: #C8C5C0 !important;
+        }}
+        /* Push main content down so the fixed hamburger doesn't overlap page content */
+        div[data-testid="stMainBlockContainer"] {{
+            padding: 0.75rem !important;
+            padding-top: 3.5rem !important;
+        }}
+        /* Ensure profile button column has enough width on narrow screens */
+        div[data-testid="stHorizontalBlock"] > div:last-child {{
+            min-width: 56px !important;
+            flex: 0 0 56px !important;
+        }}
+        div[data-testid="stHorizontalBlock"] > div:first-child {{
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+        }}
+    }}
     </style>""", unsafe_allow_html=True)
 
 def metric(label, val, sub=""):
@@ -2777,8 +2885,45 @@ def _agent_hour_breakdown(agent_name, week_start):
             )
 
 
+def _fmt_time_ago(ts: datetime.datetime) -> str:
+    diff = int((datetime.datetime.now() - ts).total_seconds())
+    if diff < 60:
+        return "just now"
+    if diff < 3600:
+        m = diff // 60
+        return f"{m} minute{'s' if m != 1 else ''} ago"
+    h = diff // 3600
+    return f"{h} hour{'s' if h != 1 else ''} ago"
+
+
+@st.fragment(run_every="30s")
+def _schedule_update_watcher(baseline: str):
+    """Polls the DB every 30 s. Shows a banner if another user saved the schedule."""
+    current = get_setting("schedule_last_modified", "")
+    if not current or current == baseline:
+        return  # No change — render nothing
+    try:
+        ts_str, saver = current.split("|", 1)
+        time_ago = _fmt_time_ago(datetime.datetime.fromisoformat(ts_str))
+        msg = f"📅 Schedule updated by **{saver}** {time_ago} — you may be viewing outdated data."
+    except Exception:
+        msg = "📅 The schedule has been updated — you may be viewing outdated data."
+    st.warning(msg)
+    if st.button("🔄 Refresh now", key=f"sched_refresh_{abs(hash(baseline)) % 99999}"):
+        # st.rerun() inside a fragment only reruns the fragment in Streamlit 1.35,
+        # so we trigger a full browser reload via JS instead.
+        st_components.html(
+            "<script>window.parent.location.reload();</script>", height=0
+        )
+
+
 def page_schedule():
     st.markdown('<div class="page-title">Schedule</div>', unsafe_allow_html=True)
+
+    # ── Schedule change watcher (all roles) ───────────────────────────────────
+    if "_sched_baseline_ver" not in st.session_state:
+        st.session_state["_sched_baseline_ver"] = get_setting("schedule_last_modified", "")
+    _schedule_update_watcher(st.session_state["_sched_baseline_ver"])
 
     # Play chime when today's schedule is saved
     if st.session_state.pop("_play_schedule_sound", False):
@@ -3739,6 +3884,11 @@ def _make_tz_slot_label_map(offset_hours):
 def page_agent_view():
     st.markdown('<div class="page-title">Agent View</div>', unsafe_allow_html=True)
 
+    # ── Schedule change watcher (all roles) ───────────────────────────────────
+    if "_av_baseline_ver" not in st.session_state:
+        st.session_state["_av_baseline_ver"] = get_setting("schedule_last_modified", "")
+    _schedule_update_watcher(st.session_state["_av_baseline_ver"])
+
     user = current_user()
     if not user:
         st.warning("Please log in.")
@@ -3832,7 +3982,7 @@ def page_agent_view():
             f"{d[:3]}  {(sel + datetime.timedelta(days=i)).strftime('%-m/%-d')}"
             for i, d in enumerate(DAYS)
         ])
-        _default_to_today_tab(week_start)
+        _default_to_today_tab(week_start, key_prefix="av_day_tab__")
         for di, dtab in enumerate(day_tabs):
             with dtab:
                 # Load schedule for the day
@@ -4072,7 +4222,7 @@ def page_timeoff():
                 </div>
             </div>""", unsafe_allow_html=True)
 
-            ca, cb, _ = st.columns([1, 1, 5])
+            ca, cb, cc, _ = st.columns([1, 1, 1, 4])
             with ca:
                 if st.button("✅ Approve", key=f"ap_{req['id']}", use_container_width=True, type="primary"):
                     u = current_user()
@@ -4099,6 +4249,11 @@ def page_timeoff():
                     )
                     st.toast("Request denied.", icon="🚫")
                     st.rerun()
+            with cc:
+                if is_admin() and st.button("🗑 Delete", key=f"del_{req['id']}", use_container_width=True):
+                    delete_time_off_request(req["id"])
+                    st.toast("Request deleted.", icon="🗑️")
+                    st.rerun()
 
     with tab_all:
         if not all_reqs:
@@ -4110,17 +4265,24 @@ def page_timeoff():
                 s = datetime.date.fromisoformat(req["start_date"])
                 e = datetime.date.fromisoformat(req["end_date"])
                 days = (e - s).days + 1
-                st.markdown(f"""<div class="req-row" style="display:flex;align-items:center;gap:12px">
-                    <div style="width:28px;height:28px;border-radius:50%;background:{tcolor}22;color:{tcolor};
-                                font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0">
-                        {"".join(p[0] for p in req["agent_name"].split()[:2]).upper()}
-                    </div>
-                    <div style="flex:1">
-                        <span style="font-size:13px;font-weight:600;color:#0F172A">{req["agent_name"]}</span>
-                        <span style="font-size:12px;color:#94A3B8;margin-left:8px">{req["type"]} · {s.strftime("%-m/%-d")}–{e.strftime("%-m/%-d")} · {days}d{f" · {req['start_time']}–{req['end_time']}" if req.get("start_time") and req.get("end_time") else " · all day"}</span>
-                    </div>
-                    {status_pill(req["status"])}
-                </div>""", unsafe_allow_html=True)
+                _ar_l, _ar_r = st.columns([10, 1])
+                with _ar_l:
+                    st.markdown(f"""<div class="req-row" style="display:flex;align-items:center;gap:12px">
+                        <div style="width:28px;height:28px;border-radius:50%;background:{tcolor}22;color:{tcolor};
+                                    font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0">
+                            {"".join(p[0] for p in req["agent_name"].split()[:2]).upper()}
+                        </div>
+                        <div style="flex:1">
+                            <span style="font-size:13px;font-weight:600;color:#0F172A">{req["agent_name"]}</span>
+                            <span style="font-size:12px;color:#94A3B8;margin-left:8px">{req["type"]} · {s.strftime("%-m/%-d")}–{e.strftime("%-m/%-d")} · {days}d{f" · {req['start_time']}–{req['end_time']}" if req.get("start_time") and req.get("end_time") else " · all day"}</span>
+                        </div>
+                        {status_pill(req["status"])}
+                    </div>""", unsafe_allow_html=True)
+                with _ar_r:
+                    if is_admin() and st.button("🗑", key=f"alldel_{req['id']}", help="Delete request", use_container_width=True):
+                        delete_time_off_request(req["id"])
+                        st.toast("Request deleted.", icon="🗑️")
+                        st.rerun()
 
     with tab_submit:
         agents_list = get_agent_names()
@@ -4219,7 +4381,7 @@ def page_roster():
     team_names = [t["name"] for t in teams]
     team_colors_map = {t["name"]: t["color"] for t in teams}
 
-    add_tab, view_tab = st.tabs(["All agents", "Add agent"])
+    add_tab, view_tab, import_tab = st.tabs(["All agents", "Add agent", "📥 Import"])
 
     with view_tab:
         st.subheader("Add new agent")
@@ -4280,10 +4442,9 @@ def page_roster():
                             n = st.text_input("Name", ag["name"])
                             t_sel = st.selectbox("Team", team_names,
                                                  index=team_names.index(ag["team_name"]) if ag["team_name"] in team_names else 0)
-                            e_sel = st.selectbox("Type", ["FT","PT"],
-                                                 index=0 if ag["employment_type"]=="FT" else 1)
-                            h = st.number_input("Hours", 1, 40, int(ag["weekly_hours"]))
-                            wd = st.text_input("Work days", ag["work_days"])
+                            e_sel = ag["employment_type"]
+                            h = int(ag["weekly_hours"])
+                            wd = ag["work_days"]
                             # Per-agent default activity override
                             act_opts = ["(use team default)"] + get_activity_names()
                             ag_def = ag.get("default_activity", "") or "(use team default)"
@@ -4428,6 +4589,61 @@ def page_roster():
                             )
                             st.toast("Lunch settings saved.", icon="✅")
 
+                        # ── Per-day lunch overrides ──────────────────────────
+                        import json as _json
+                        _ovr_raw = _ag_lunch.get("lunch_overrides")
+                        _ovr_dict = {}
+                        if _ovr_raw:
+                            try:
+                                _ovr_dict = _json.loads(_ovr_raw)
+                            except Exception:
+                                _ovr_dict = {}
+
+                        _agent_days = [d[:3] for d in DAYS]  # always show all 7 days
+
+                        with st.expander("Day overrides"):
+                            _new_ovr = {}
+                            for _wd in _agent_days:
+                                _oc1, _oc2, _oc3 = st.columns([1, 3, 2])
+                                with _oc1:
+                                    st.markdown(f"<div style='padding-top:6px;font-size:12px;font-weight:600'>{_wd}</div>", unsafe_allow_html=True)
+                                _day_ovr_val = _ovr_dict.get(_wd, "DEFAULT_SENTINEL")
+                                if _day_ovr_val == "DEFAULT_SENTINEL":
+                                    _cur_time_choice = "Default"
+                                elif _day_ovr_val is None:
+                                    _cur_time_choice = "No lunch"
+                                else:
+                                    _cur_time_choice = _day_ovr_val.get("slot", "Default") if isinstance(_day_ovr_val, dict) else "Default"
+
+                                _time_opts = ["Default", "No lunch"] + TIME_SLOTS
+                                _ti = _time_opts.index(_cur_time_choice) if _cur_time_choice in _time_opts else 0
+                                with _oc2:
+                                    _sel_t = st.selectbox(
+                                        _wd, _time_opts, index=_ti,
+                                        key=f"lo_t_{ag['id']}_{_wd}",
+                                        label_visibility="collapsed",
+                                    )
+                                with _oc3:
+                                    if _sel_t not in ("Default", "No lunch"):
+                                        _cur_dur_ovr = _day_ovr_val.get("duration", _cur_dur) if isinstance(_day_ovr_val, dict) else _cur_dur
+                                        _di_ovr = _DUR_OPTS.index(_cur_dur_ovr) if _cur_dur_ovr in _DUR_OPTS else 0
+                                        _sel_d = st.selectbox(
+                                            "Dur", _DUR_OPTS, index=_di_ovr,
+                                            key=f"lo_d_{ag['id']}_{_wd}",
+                                            label_visibility="collapsed",
+                                            format_func=lambda x: _DUR_LABELS[x],
+                                        )
+                                        _new_ovr[_wd] = {"slot": _sel_t, "duration": _sel_d}
+                                    elif _sel_t == "No lunch":
+                                        _new_ovr[_wd] = None
+                                        st.markdown("<div style='padding-top:6px;color:#94A3B8;font-size:12px'>—</div>", unsafe_allow_html=True)
+                                    else:
+                                        st.markdown("<div style='padding-top:6px;color:#94A3B8;font-size:12px'>—</div>", unsafe_allow_html=True)
+
+                            if st.button("Save day overrides", key=f"lo_save_{ag['id']}", use_container_width=True):
+                                save_agent_lunch_overrides(ag["name"], _new_ovr)
+                                st.toast("Day overrides saved.", icon="✅")
+
                         # ── Linked login account ────────────────────────────────
                         st.markdown(
                             '<div style="font-size:10px;font-weight:700;color:#689985;'
@@ -4469,6 +4685,255 @@ def page_roster():
                             upsert_agent(ag["name"], new_team, ag["employment_type"],
                                          ag["weekly_hours"], ag["work_days"], ag.get("notes",""), ag["id"])
                             st.rerun()
+
+    with import_tab:
+        st.subheader("Bulk import agents")
+
+        # Template download
+        _IMPORT_COLS = ["Name","Team","Employment Type","Weekly Hours","Work Days","Default Activity","Slack Member ID","Notes"]
+        _template_df = pd.DataFrame([
+            ["Jane Smith",  "Support", "FT", 40, "Mon,Tue,Wed,Thu,Fri", "Calls",  "",           ""],
+            ["John Doe",    "CA",      "PT", 32, "Mon,Tue,Wed,Thu,Fri", "Chat",   "U0A1B2C3D4", "Bilingual"],
+        ], columns=_IMPORT_COLS)
+        _csv_bytes = _template_df.to_csv(index=False).encode()
+        st.download_button("⬇ Download column template", _csv_bytes, "roster_import_template.csv", "text/csv", key="roster_dl_template")
+
+        st.markdown("""
+        **Required columns:** Name, Team  |  **Optional:** Employment Type (FT/PT), Weekly Hours, Work Days, Default Activity, Slack Member ID, Notes
+        Column names are case-insensitive. Agents whose names already exist will be skipped.
+        """)
+
+        # ── Source selector ────────────────────────────────────────────────────
+        _src = st.radio("Import from", ["Google Sheets", "File (CSV / Excel)"],
+                        horizontal=True, key="roster_import_src",
+                        label_visibility="collapsed")
+
+        # imp_df is stored in session state so it survives the rerun triggered
+        # by clicking the Import button (at that point _gs_load is False again).
+        imp_df = st.session_state.get("_roster_import_df")
+
+        if _src == "Google Sheets":
+            st.markdown(
+                "Paste the Google Sheets URL below. The sheet must be shared as **Anyone with the link can view**."
+            )
+            _gs_col, _gs_btn_col = st.columns([5, 1])
+            with _gs_col:
+                _gs_url = st.text_input("Google Sheets URL", placeholder="https://docs.google.com/spreadsheets/d/…",
+                                        label_visibility="collapsed", key="roster_gs_url")
+            with _gs_btn_col:
+                _gs_load = st.button("Load", key="roster_gs_load", use_container_width=True)
+
+            if _gs_load and _gs_url.strip():
+                import re, urllib.request, io
+                _match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", _gs_url)
+                if not _match:
+                    st.error("Couldn't find a Sheet ID in that URL — make sure you're pasting the full Google Sheets link.")
+                else:
+                    _sheet_id = _match.group(1)
+                    _gid_match = re.search(r"[#&?]gid=(\d+)", _gs_url)
+                    _gid_param = f"&gid={_gid_match.group(1)}" if _gid_match else ""
+                    _export_url = f"https://docs.google.com/spreadsheets/d/{_sheet_id}/export?format=csv{_gid_param}"
+                    try:
+                        import ssl as _ssl
+                        _ctx = _ssl.create_default_context()
+                        _ctx.check_hostname = False
+                        _ctx.verify_mode = _ssl.CERT_NONE
+                        with urllib.request.urlopen(_export_url, timeout=10, context=_ctx) as _resp:
+                            _csv_data = _resp.read().decode("utf-8")
+                        imp_df = pd.read_csv(io.StringIO(_csv_data))
+                        st.session_state["_roster_import_df"] = imp_df  # persist across reruns
+                        st.success(f"Loaded {len(imp_df)} row(s) from Google Sheets.")
+                    except urllib.error.HTTPError as _he:
+                        if _he.code == 401:
+                            st.error("Access denied — make sure the sheet is shared as 'Anyone with the link can view'.")
+                        else:
+                            st.error(f"Could not load sheet (HTTP {_he.code}). Check the URL and sharing settings.")
+                    except Exception as _ge:
+                        st.error(f"Could not load sheet: {_ge}")
+
+        else:
+            # Clear any cached Google Sheets data when switching to file mode
+            st.session_state.pop("_roster_import_df", None)
+            imp_df = None
+            uploaded_file = st.file_uploader("Choose CSV or Excel file", type=["csv","xlsx"], key="roster_import_uploader")
+            if uploaded_file:
+                try:
+                    if uploaded_file.name.lower().endswith(".csv"):
+                        imp_df = pd.read_csv(uploaded_file)
+                    else:
+                        imp_df = pd.read_excel(uploaded_file)
+                except Exception as _e:
+                    st.error(f"Could not read file: {_e}")
+
+        if imp_df is not None and not imp_df.empty:
+            # ── Normalize column names ─────────────────────────────────────────
+            _col_aliases = {
+                "name": "name", "full name": "name",
+                "team": "team_name", "team name": "team_name", "team_name": "team_name",
+                "employment type": "employment_type", "type": "employment_type",
+                "employment_type": "employment_type", "emp type": "employment_type",
+                "weekly hours": "weekly_hours", "hours": "weekly_hours",
+                "weekly_hours": "weekly_hours", "hrs": "weekly_hours",
+                "work days": "work_days", "work_days": "work_days", "days": "work_days",
+                "default activity": "default_activity", "default_activity": "default_activity",
+                "activity": "default_activity",
+                "slack member id": "slack_user_id", "slack id": "slack_user_id",
+                "slack_user_id": "slack_user_id", "slack member": "slack_user_id",
+                "notes": "notes", "note": "notes",
+            }
+            imp_df.columns = [_col_aliases.get(c.lower().strip(), c.lower().strip()) for c in imp_df.columns]
+
+            # ── Check required columns ─────────────────────────────────────────
+            if "name" not in imp_df.columns:
+                st.error('File must include a "Name" column.')
+            elif "team_name" not in imp_df.columns:
+                st.error('File must include a "Team" column.')
+            else:
+                existing_agent_names = {a["name"].strip().lower() for a in get_agents()}
+                valid_team_set = set(team_names)
+
+                def _clean(val, default=""):
+                    s = str(val).strip()
+                    return default if s in ("", "nan", "NaN", "None") else s
+
+                rows_display = []
+                rows_to_import = []
+
+                for _, row in imp_df.iterrows():
+                    name_val    = _clean(row.get("name", ""))
+                    team_val    = _clean(row.get("team_name", ""))
+                    emp_val     = _clean(row.get("employment_type", ""), "FT").upper()
+                    work_days_v = _clean(row.get("work_days", ""), "Mon,Tue,Wed,Thu,Fri")
+                    def_act_v   = _clean(row.get("default_activity", ""))
+                    slack_v     = _clean(row.get("slack_user_id", ""))
+                    notes_v     = _clean(row.get("notes", ""))
+                    try:
+                        hrs_val = int(float(_clean(row.get("weekly_hours", "40"), "40")))
+                    except (ValueError, TypeError):
+                        hrs_val = 40
+
+                    errors = []
+                    warnings = []
+
+                    if not name_val:
+                        errors.append("Name is empty")
+                    elif name_val.lower() in existing_agent_names:
+                        warnings.append("Already exists — will skip")
+
+                    if not team_val:
+                        errors.append("Team is empty")
+                    elif team_val not in valid_team_set:
+                        errors.append(f'Team "{team_val}" not found')
+
+                    if emp_val not in ("FT", "PT"):
+                        warnings.append(f'Unknown type "{emp_val}" -> defaulting to FT')
+                        emp_val = "FT"
+
+                    hrs_val = max(1, min(hrs_val, 40))
+
+                    is_dup   = bool(warnings and "Already exists" in warnings[0])
+                    is_error = bool(errors)
+                    status   = "error" if is_error else ("skip" if is_dup else "ok")
+                    issue_txt = "; ".join(errors + warnings) if (errors or warnings) else "Ready to import"
+
+                    rows_display.append({
+                        "Name": name_val, "Team": team_val, "Type": emp_val,
+                        "Hours": hrs_val, "Work Days": work_days_v,
+                        "Status": status, "Issues": issue_txt,
+                    })
+
+                    if status == "ok":
+                        rows_to_import.append({
+                            "name": name_val, "team_name": team_val,
+                            "employment_type": emp_val, "weekly_hours": hrs_val,
+                            "work_days": work_days_v, "default_activity": def_act_v,
+                            "slack_user_id": slack_v or None, "notes": notes_v,
+                        })
+
+                _cnt_ok   = sum(1 for r in rows_display if r["Status"] == "ok")
+                _cnt_skip = sum(1 for r in rows_display if r["Status"] == "skip")
+                _cnt_err  = sum(1 for r in rows_display if r["Status"] == "error")
+
+                st.markdown(
+                    f"**{len(rows_display)} row(s) found** — "
+                    f"<span style='color:#15803D;font-weight:600'>{_cnt_ok} ready</span>, "
+                    f"<span style='color:#92400E;font-weight:600'>{_cnt_skip} skipping (duplicate)</span>, "
+                    f"<span style='color:#DC2626;font-weight:600'>{_cnt_err} error(s)</span>",
+                    unsafe_allow_html=True
+                )
+
+                # ── Preview table ──────────────────────────────────────────────
+                _rows_html = ""
+                for r in rows_display:
+                    if r["Status"] == "ok":
+                        bg    = "#F0FDF4"
+                        badge = '<span style="color:#15803D;font-weight:700">✓ Ready</span>'
+                    elif r["Status"] == "skip":
+                        bg    = "#FFFBEB"
+                        badge = '<span style="color:#92400E;font-weight:700">⚠ Skip</span>'
+                    else:
+                        bg    = "#FEF2F2"
+                        badge = '<span style="color:#DC2626;font-weight:700">✗ Error</span>'
+                    _rows_html += (
+                        f'<tr style="background:{bg}">'
+                        f'<td style="padding:5px 8px">{r["Name"]}</td>'
+                        f'<td style="padding:5px 8px">{r["Team"]}</td>'
+                        f'<td style="padding:5px 8px">{r["Type"]}</td>'
+                        f'<td style="padding:5px 8px;text-align:center">{r["Hours"]}</td>'
+                        f'<td style="padding:5px 8px">{r["Work Days"]}</td>'
+                        f'<td style="padding:5px 8px">{badge}</td>'
+                        f'<td style="padding:5px 8px;color:#64748B;font-size:10px">{r["Issues"]}</td>'
+                        f'</tr>'
+                    )
+                _th = lambda txt: f'<th style="padding:6px 8px;text-align:left;border-bottom:2px solid #E2E8F0;white-space:nowrap">{txt}</th>'
+                st.markdown(
+                    f'<div style="overflow-x:auto;border:1px solid #E2E8F0;border-radius:6px;margin:12px 0">'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:12px">'
+                    f'<thead><tr style="background:#F8FAFC">'
+                    f'{_th("Name")}{_th("Team")}{_th("Type")}{_th("Hrs")}{_th("Work Days")}{_th("Status")}{_th("Notes")}'
+                    f'</tr></thead>'
+                    f'<tbody>{_rows_html}</tbody>'
+                    f'</table></div>',
+                    unsafe_allow_html=True
+                )
+
+                # ── Confirm button ─────────────────────────────────────────────
+                if _cnt_ok > 0:
+                    if st.button(
+                        f"✅ Import {_cnt_ok} agent{'s' if _cnt_ok != 1 else ''}",
+                        type="primary",
+                        key="roster_import_confirm",
+                    ):
+                        _imported = 0
+                        _failed   = []
+                        _conn_imp = get_conn()
+                        for r in rows_to_import:
+                            try:
+                                _conn_imp.execute(
+                                    """INSERT INTO agents
+                                       (name,team_name,employment_type,weekly_hours,
+                                        work_days,default_activity,slack_user_id,notes)
+                                       VALUES (?,?,?,?,?,?,?,?)""",
+                                    (r["name"], r["team_name"], r["employment_type"],
+                                     r["weekly_hours"], r["work_days"],
+                                     r["default_activity"], r["slack_user_id"], r["notes"]),
+                                )
+                                _imported += 1
+                            except Exception:
+                                _failed.append(r["name"])
+                        _conn_imp.commit()
+                        _conn_imp.close()
+                        if _failed:
+                            st.warning(f"Skipped (error saving): {', '.join(_failed)}")
+                        if _imported:
+                            st.session_state.pop("_roster_import_df", None)  # clear cached sheet
+                            st.success(f"✅ Imported {_imported} agent{'s' if _imported != 1 else ''} — reloading roster…")
+                            st_components.html(
+                                "<script>setTimeout(()=>window.parent.location.reload(),1200);</script>",
+                                height=0
+                            )
+                elif _cnt_err == 0 and _cnt_skip > 0:
+                    st.info("All rows are duplicates — nothing new to import.")
 
 
 # ─── PAGE: TEAMS ──────────────────────────────────────────────────────────────

@@ -4,7 +4,11 @@
 <meta charset="utf-8">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 11px; background: #fff; }
+html, body {
+  font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 11px; background: #fff;
+  height: 100%; overflow: hidden;   /* component scrolls internally, not the Streamlit page */
+}
+body { display: flex; flex-direction: column; }
 
 /* ── Toolbar ── */
 #toolbar {
@@ -34,11 +38,15 @@ html, body { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 11px; 
 /* ── Main body: table + counts side panel ── */
 #body {
   display: flex;
+  flex: 1;           /* fill remaining height below toolbar */
+  overflow: hidden;  /* children control their own scroll */
+  min-height: 0;     /* required for flex children to shrink below content height */
 }
 
 /* ── Table wrapper ── */
 #wrap {
-  flex: 1; overflow-x: auto; overflow-y: visible; min-width: 0;
+  flex: 1; overflow: auto; min-width: 0;
+  /* overflow:auto on both axes lets thead th { position:sticky; top:0 } work */
 }
 
 /* ── Count panel (right side) ── */
@@ -67,7 +75,8 @@ html, body { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 11px; 
   flex: 1; text-align: center;
   font-size: 10px; font-weight: 700; color: #065f46;
 }
-#cpanel-rows { flex: 1; overflow: hidden; }
+#cpanel-rows { flex: 1; overflow-y: scroll; scrollbar-width: none; }
+#cpanel-rows::-webkit-scrollbar { display: none; }
 #cpanel-rows table {
   border-collapse: collapse; width: 100%; table-layout: fixed;
 }
@@ -227,20 +236,33 @@ sendReady();
 
 // ── Layout ─────────────────────────────────────────────────────────
 function sizeWrap() {
-  setTimeout(() => setHeight(document.body.scrollHeight + 4), 50);
+  // Cap the component height so it scrolls internally — this makes the sticky
+  // thead header work. At least 520px; at most (viewport - 160px) or 720px.
+  var h = Math.min(Math.max(780, window.innerHeight - 160), 1100);
+  setTimeout(() => setHeight(h), 50);
 }
 window.addEventListener('resize', sizeWrap);
+
+// Sync the count panel scroll position with the table scroll
+document.getElementById('wrap').addEventListener('scroll', function () {
+  document.getElementById('cpanel-rows').scrollTop = this.scrollTop;
+});
 
 // ── Color helpers ──────────────────────────────────────────────────
 function cbg(v) { return A && A.color_map[v] ? A.color_map[v].bg : '#F8FAFC'; }
 function cfg(v) { return A && A.color_map[v] ? A.color_map[v].fg : '#CBD5E1'; }
 
 // ── Build schedule table ───────────────────────────────────────────
+function shortName(n) {
+  const p = n.trim().split(/\s+/);
+  return p.length > 1 ? p[0] + ' ' + p[p.length - 1][0] + '.' : n;
+}
+
 function buildTable(a) {
   const { schedule_data, agents, time_slots, activities } = a;
   const tbl = document.getElementById('tbl');
   let h = '<thead><tr><th class="th-time">Time</th>';
-  agents.forEach(ag => { h += `<th title="${ag}">${ag.split(' ')[0]}</th>`; });
+  agents.forEach(ag => { h += `<th title="${ag}">${shortName(ag)}</th>`; });
   h += '</tr></thead><tbody>';
 
   time_slots.forEach((slot, ri) => {
