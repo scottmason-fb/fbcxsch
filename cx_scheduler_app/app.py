@@ -2959,10 +2959,12 @@ def page_schedule():
         with c2:
             if st.button("⬅ Prev", key="ag_prev", use_container_width=True):
                 st.session_state["agent_sched_week"] -= datetime.timedelta(weeks=1)
+                st.session_state["agent_sched_week_input"] = st.session_state["agent_sched_week"]
                 st.rerun()
         with c3:
             if st.button("Next ➡", key="ag_next", use_container_width=True):
                 st.session_state["agent_sched_week"] += datetime.timedelta(weeks=1)
+                st.session_state["agent_sched_week_input"] = st.session_state["agent_sched_week"]
                 st.rerun()
         with c1:
             sel = st.date_input("Week", value=st.session_state["agent_sched_week"],
@@ -3083,10 +3085,12 @@ def page_schedule():
     with c2:
         if st.button("⬅ Prev week", use_container_width=True):
             st.session_state["sched_week"] -= datetime.timedelta(weeks=1)
+            st.session_state["sched_week_input"] = st.session_state["sched_week"]
             st.rerun()
     with c3:
         if st.button("Next week ➡", use_container_width=True):
             st.session_state["sched_week"] += datetime.timedelta(weeks=1)
+            st.session_state["sched_week_input"] = st.session_state["sched_week"]
             st.rerun()
     with c1:
         sel = st.date_input(
@@ -3905,10 +3909,12 @@ def page_agent_view():
     with hc2:
         if st.button("⬅ Prev", key="av_prev", use_container_width=True):
             st.session_state["av_sched_week"] -= datetime.timedelta(weeks=1)
+            st.session_state["av_week_input"] = st.session_state["av_sched_week"]
             st.rerun()
     with hc3:
         if st.button("Next ➡", key="av_next", use_container_width=True):
             st.session_state["av_sched_week"] += datetime.timedelta(weeks=1)
+            st.session_state["av_week_input"] = st.session_state["av_sched_week"]
             st.rerun()
     with hc1:
         sel = st.date_input(
